@@ -1,0 +1,9 @@
+{
+  "id": "scion-sync",
+  "name": "Scion Sync",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Self-hosted Obsidian vault sync using a Raspberry Pi server",
+  "author": "Lavish Mantri",
+  "isDesktopOnly": false
+}
