@@ -5,6 +5,11 @@
   display: flex;
   align-items: center;
   gap: 4px;
+  cursor: pointer;
+}
+
+.scion-sync-status:hover {
+  text-decoration: underline;
 }
 
 .scion-sync-status.syncing {
@@ -18,4 +23,84 @@
 .scion-sync-status.error {
   color: var(--color-red);
   cursor: help;
+}
+
+/* Settings status info */
+.scion-sync-status-info {
+  background: var(--background-secondary);
+  padding: 12px;
+  border-radius: 8px;
+  margin-top: 8px;
+}
+
+.scion-sync-status-info p {
+  margin: 4px 0;
+  font-size: 0.9em;
+  color: var(--text-muted);
+}
+
+/* Sync Status Modal */
+.scion-status-info,
+.scion-status-stats {
+  padding: 8px 0;
+}
+
+.scion-status-info p,
+.scion-status-stats p {
+  margin: 6px 0;
+}
+
+.scion-status-actions {
+  margin-top: 16px;
+}
+
+.scion-status-actions .setting-item {
+  border: none;
+  padding: 0;
+}
+
+/* Conflict Modal */
+.scion-conflict-modal {
+  max-width: 600px;
+}
+
+.scion-conflict-desc {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.scion-conflict-preview {
+  background: var(--background-secondary);
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  max-height: 200px;
+  font-size: 0.85em;
+}
+
+.scion-conflict-preview code {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Conflict markers styling in editor */
+.cm-line:has(.cm-hmd-codeblock) {
+  /* Style for conflict markers in code view */
+}
+
+/* Diff-like styling for conflict markers */
+.scion-conflict-local {
+  background: rgba(var(--color-green-rgb), 0.1);
+  border-left: 3px solid var(--color-green);
+}
+
+.scion-conflict-remote {
+  background: rgba(var(--color-red-rgb), 0.1);
+  border-left: 3px solid var(--color-red);
+}
+
+.scion-conflict-marker {
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+  font-weight: bold;
 }

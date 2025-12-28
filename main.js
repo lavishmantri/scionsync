@@ -37,7 +37,13 @@ var _SyncService = class _SyncService {
     this.debounceTimers = /* @__PURE__ */ new Map();
     this.eventRefs = [];
     this.statusCallback = null;
+    this.conflictCallback = null;
     this.isSyncing = false;
+    this.pollTimer = null;
+    this.lastHeadCommit = null;
+    this.pendingConflicts = [];
+    this.isUserActive = false;
+    this.activityTimer = null;
     this.app = app;
     this.vault = app.vault;
     this.settings = settings;
@@ -47,6 +53,7 @@ var _SyncService = class _SyncService {
     console.log("SyncService: Constructor called", {
       serverUrl: settings.serverUrl,
       vaultName: this.vaultName,
+      pollInterval: settings.pollInterval,
       existingSyncStateCount: Object.keys(this.syncState).length
     });
   }
@@ -60,6 +67,10 @@ var _SyncService = class _SyncService {
     this.statusCallback = callback;
     console.log("SyncService: Status callback registered");
   }
+  setConflictCallback(callback) {
+    this.conflictCallback = callback;
+    console.log("SyncService: Conflict callback registered");
+  }
   updateStatus(status, message) {
     var _a;
     console.log(`SyncService: Status changed to '${status}'`, message ? { message } : "");
@@ -68,12 +79,88 @@ var _SyncService = class _SyncService {
   async initialize() {
     console.log("SyncService: Initializing...");
     try {
-      await this.syncAll();
+      if (this.settings.syncOnStartup) {
+        await this.syncAll();
+      }
       this.setupFileWatcher();
+      if (this.settings.autoSync) {
+        this.startPolling();
+      }
       console.log("SyncService: Initialization complete");
     } catch (error) {
       console.error("SyncService: Initialization failed", error);
       new import_obsidian.Notice("Scion Sync: Failed to connect to server");
+    }
+  }
+  /**
+   * Start polling for changes
+   */
+  startPolling() {
+    if (this.pollTimer) {
+      console.log("SyncService: Polling already active");
+      return;
+    }
+    const interval = this.settings.pollInterval * 1e3;
+    console.log(`SyncService: Starting polling every ${this.settings.pollInterval}s`);
+    this.pollTimer = setInterval(async () => {
+      await this.checkForChanges();
+    }, interval);
+  }
+  /**
+   * Stop polling
+   */
+  stopPolling() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+      console.log("SyncService: Polling stopped");
+    }
+  }
+  /**
+   * Check server for changes (polling)
+   */
+  async checkForChanges() {
+    if (this.isUserActive) {
+      console.log("SyncService: Skipping poll - user is active");
+      return;
+    }
+    if (this.isSyncing) {
+      return;
+    }
+    try {
+      const url = `${this.getVaultBaseUrl()}/status?since=${this.lastHeadCommit || ""}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        console.error("SyncService: Status check failed", response.status);
+        return;
+      }
+      const data = await response.json();
+      if (data.has_changes && data.changed_files.length > 0) {
+        console.log(`SyncService: Server has ${data.changed_files.length} changed files`);
+        await Promise.all(data.changed_files.map((filePath) => this.downloadFile(filePath)));
+        this.lastHeadCommit = data.head_commit;
+        new import_obsidian.Notice(`Scion Sync: Downloaded ${data.changed_files.length} file(s)`);
+      }
+    } catch (error) {
+      console.error("SyncService: Polling error", error);
+    }
+  }
+  /**
+   * Update settings (called when user changes settings)
+   */
+  updateSettings(settings) {
+    const pollIntervalChanged = this.settings.pollInterval !== settings.pollInterval;
+    const autoSyncChanged = this.settings.autoSync !== settings.autoSync;
+    this.settings = settings;
+    if (autoSyncChanged) {
+      if (settings.autoSync) {
+        this.startPolling();
+      } else {
+        this.stopPolling();
+      }
+    } else if (pollIntervalChanged && settings.autoSync) {
+      this.stopPolling();
+      this.startPolling();
     }
   }
   async syncAll() {
@@ -88,34 +175,78 @@ var _SyncService = class _SyncService {
       console.log("SyncService: Fetching server manifest...");
       const manifest = await this.fetchManifest();
       const serverFiles = new Map(manifest.files.map((f) => [f.path, f]));
-      console.log(`SyncService: Server has ${serverFiles.size} files`);
+      this.lastHeadCommit = manifest.head_commit;
+      console.log(`SyncService: Server has ${serverFiles.size} files, head: ${manifest.head_commit}`);
       const localFiles = this.vault.getFiles();
       const localPaths = new Set(localFiles.map((f) => f.path));
       console.log(`SyncService: Local vault has ${localFiles.length} files`);
+      const downloadsNeeded = [];
+      const uploadsNeeded = [];
+      const deletionsNeeded = [];
+      const hashCache = /* @__PURE__ */ new Map();
       for (const [serverPath, serverRecord] of serverFiles) {
         const localState = this.syncState[serverPath];
         if (!localPaths.has(serverPath)) {
-          console.log(`SyncService: Downloading new file: ${serverPath}`);
-          await this.downloadFile(serverPath);
-        } else if (localState && serverRecord.revision > localState.revision) {
-          console.log(`SyncService: Downloading updated file: ${serverPath}`);
-          await this.downloadFile(serverPath);
+          if (!localState) {
+            console.log(`SyncService: Scheduling download of new file: ${serverPath}`);
+            downloadsNeeded.push(serverPath);
+          } else {
+            console.log(`SyncService: File ${serverPath} was deleted locally, will be deleted from server`);
+            deletionsNeeded.push(serverPath);
+          }
+        } else if (localState && serverRecord.commit !== localState.commit) {
+          console.log(`SyncService: Server has different version: ${serverPath}`);
+          let currentHash = hashCache.get(serverPath);
+          if (!currentHash) {
+            currentHash = await this.computeLocalHash(serverPath);
+            hashCache.set(serverPath, currentHash);
+          }
+          if (currentHash !== localState.hash) {
+            console.log(`SyncService: Local changes exist, scheduling upload for merge: ${serverPath}`);
+            uploadsNeeded.push(serverPath);
+          } else {
+            console.log(`SyncService: Scheduling download of updated file: ${serverPath}`);
+            downloadsNeeded.push(serverPath);
+          }
         }
       }
       for (const file of localFiles) {
         const serverRecord = serverFiles.get(file.path);
         const localState = this.syncState[file.path];
         if (!serverRecord) {
-          console.log(`SyncService: Uploading new file: ${file.path}`);
-          await this.uploadFile(file.path);
+          console.log(`SyncService: Scheduling upload of new file: ${file.path}`);
+          uploadsNeeded.push(file.path);
         } else if (localState) {
-          const currentHash = await this.computeLocalHash(file.path);
+          let currentHash = hashCache.get(file.path);
+          if (!currentHash) {
+            currentHash = await this.computeLocalHash(file.path);
+            hashCache.set(file.path, currentHash);
+          }
           if (currentHash !== localState.hash) {
-            console.log(`SyncService: Uploading modified file: ${file.path}`);
-            await this.uploadFile(file.path);
+            console.log(`SyncService: Scheduling upload of modified file: ${file.path}`);
+            uploadsNeeded.push(file.path);
           }
         }
       }
+      for (const syncedPath of Object.keys(this.syncState)) {
+        if (!localPaths.has(syncedPath)) {
+          console.log(`SyncService: Scheduling deletion from server: ${syncedPath}`);
+          deletionsNeeded.push(syncedPath);
+        }
+      }
+      console.log(`SyncService: Executing ${downloadsNeeded.length} downloads, ${uploadsNeeded.length} uploads, ${deletionsNeeded.length} deletions`);
+      await Promise.all([
+        ...downloadsNeeded.map((path) => this.downloadFile(path)),
+        ...uploadsNeeded.map((path) => this.uploadFile(path)),
+        ...deletionsNeeded.map((path) => this.deleteFromServer(path))
+      ]);
+      for (const deletedPath of deletionsNeeded) {
+        delete this.syncState[deletedPath];
+      }
+      if (deletionsNeeded.length > 0) {
+        await this.saveSyncState();
+      }
+      this.clearResolvedConflicts();
       console.log("SyncService: Full sync completed successfully");
       this.updateStatus("success");
       new import_obsidian.Notice("Scion Sync: Sync complete");
@@ -141,41 +272,156 @@ var _SyncService = class _SyncService {
       const base64Content = this.arrayBufferToBase64(content);
       console.log(`SyncService: Read file ${path}, size: ${content.byteLength} bytes`);
       const localState = this.syncState[path];
-      const clientRevision = (_a = localState == null ? void 0 : localState.revision) != null ? _a : null;
-      console.log(`SyncService: Upload ${path} with client_revision: ${clientRevision}`);
+      const baseCommit = (_a = localState == null ? void 0 : localState.commit) != null ? _a : null;
+      console.log(`SyncService: Upload ${path} with base_commit: ${baseCommit}`);
       const response = await fetch(`${this.getVaultBaseUrl()}/sync`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           path,
           content: base64Content,
-          client_revision: clientRevision
+          base_commit: baseCommit
         })
       });
       console.log(`SyncService: Upload response status: ${response.status}`);
-      if (response.status === 409) {
-        const data = await response.json();
-        console.warn(`SyncService: Conflict detected for ${path}`, data);
-        await this.handleConflict(path);
-        return;
-      }
       if (!response.ok) {
         const errorText = await response.text();
         console.error(`SyncService: Upload failed for ${path}`, { status: response.status, body: errorText });
         throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
       }
       const result = await response.json();
-      console.log(`SyncService: Upload successful for ${path}`, { hash: result.hash, revision: result.revision });
+      console.log(`SyncService: Upload result for ${path}`, {
+        commit: result.commit,
+        merged: result.merged,
+        has_conflicts: result.has_conflicts
+      });
+      if (result.has_conflicts && result.merged_content) {
+        await this.handleConflict(path, result);
+        return;
+      }
+      if (result.merged && result.merged_content) {
+        const mergedBuffer = this.base64ToArrayBuffer(result.merged_content);
+        await this.vault.modifyBinary(file, mergedBuffer);
+        console.log(`SyncService: Updated ${path} with merged content`);
+      }
       this.syncState[path] = {
         hash: result.hash,
-        revision: result.revision
+        commit: result.commit
       };
       await this.saveSyncState();
-      console.log(`SyncService: Uploaded ${path} (revision ${result.revision})`);
+      console.log(`SyncService: Uploaded ${path} (commit ${result.commit})`);
     } catch (error) {
       console.error(`SyncService: Failed to upload ${path}`, error);
       throw error;
     }
+  }
+  /**
+   * Delete a file from the server
+   */
+  async deleteFromServer(path) {
+    try {
+      const url = `${this.getVaultBaseUrl()}/file/${encodeURIComponent(path)}`;
+      console.log(`SyncService: Deleting from server: ${path}`);
+      const response = await fetch(url, { method: "DELETE" });
+      if (response.ok || response.status === 404) {
+        console.log(`SyncService: Deleted ${path} from server`);
+        return true;
+      }
+      console.error(`SyncService: Failed to delete ${path}`, response.status);
+      return false;
+    } catch (error) {
+      console.error(`SyncService: Delete error for ${path}`, error);
+      return false;
+    }
+  }
+  async handleConflict(path, result) {
+    var _a;
+    console.log(`SyncService: Handling conflict for: ${path}`);
+    if (!result.merged_content) {
+      console.error("SyncService: No merged content in conflict response");
+      return;
+    }
+    const file = this.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian.TFile)) {
+      return;
+    }
+    const localContent = await this.vault.read(file);
+    const mergedContent = Buffer.from(result.merged_content, "base64").toString("utf-8");
+    const conflict = {
+      path,
+      mergedContent,
+      localContent,
+      serverCommit: result.commit
+    };
+    switch (this.settings.conflictMode) {
+      case "ask":
+        this.pendingConflicts.push(conflict);
+        (_a = this.conflictCallback) == null ? void 0 : _a.call(this, conflict);
+        new import_obsidian.Notice(`Scion Sync: Conflict in "${path}" - please resolve`);
+        break;
+      case "local":
+        console.log(`SyncService: Keeping local version for ${path}`);
+        this.syncState[path] = { hash: result.hash, commit: result.commit };
+        await this.saveSyncState();
+        await this.uploadFile(path);
+        break;
+      case "remote":
+        console.log(`SyncService: Taking server version for ${path}`);
+        await this.downloadFile(path);
+        break;
+      case "merge":
+      default:
+        console.log(`SyncService: Writing merged content with markers for ${path}`);
+        await this.vault.modify(file, mergedContent);
+        this.syncState[path] = {
+          hash: result.hash,
+          commit: result.commit
+        };
+        await this.saveSyncState();
+        new import_obsidian.Notice(`Scion Sync: Conflict in "${path}" - resolve markers and save`);
+        break;
+    }
+  }
+  /**
+   * Resolve a pending conflict
+   */
+  async resolveConflict(path, resolution, content) {
+    const file = this.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian.TFile)) {
+      return;
+    }
+    switch (resolution) {
+      case "local":
+        await this.uploadFile(path);
+        break;
+      case "remote":
+        await this.downloadFile(path);
+        break;
+      case "merged":
+        if (content) {
+          await this.vault.modify(file, content);
+          await this.uploadFile(path);
+        }
+        break;
+    }
+    this.pendingConflicts = this.pendingConflicts.filter((c) => c.path !== path);
+  }
+  /**
+   * Get pending conflicts
+   */
+  getPendingConflicts() {
+    return [...this.pendingConflicts];
+  }
+  /**
+   * Clear resolved conflicts (call after user has addressed them)
+   */
+  clearResolvedConflicts() {
+    this.pendingConflicts = this.pendingConflicts.filter((conflict) => {
+      const file = this.vault.getAbstractFileByPath(conflict.path);
+      const stillExists = file instanceof import_obsidian.TFile;
+      const hasLocalState = !!this.syncState[conflict.path];
+      return stillExists && hasLocalState;
+    });
   }
   async downloadFile(path) {
     console.log(`SyncService: downloadFile called for: ${path}`);
@@ -190,9 +436,9 @@ var _SyncService = class _SyncService {
         throw new Error(`Download failed: ${response.status} ${response.statusText}`);
       }
       const content = await response.arrayBuffer();
-      const revision = parseInt(response.headers.get("X-File-Revision") || "1", 10);
+      const commit = response.headers.get("X-File-Commit") || "";
       const hash = response.headers.get("X-File-Hash") || "";
-      console.log(`SyncService: Downloaded ${path}, size: ${content.byteLength} bytes, revision: ${revision}`);
+      console.log(`SyncService: Downloaded ${path}, size: ${content.byteLength} bytes, commit: ${commit}`);
       const existingFile = this.vault.getAbstractFileByPath(path);
       if (existingFile instanceof import_obsidian.TFile) {
         console.log(`SyncService: Updating existing file: ${path}`);
@@ -206,9 +452,9 @@ var _SyncService = class _SyncService {
         console.log(`SyncService: Creating new file: ${path}`);
         await this.vault.createBinary(path, content);
       }
-      this.syncState[path] = { hash, revision };
+      this.syncState[path] = { hash, commit };
       await this.saveSyncState();
-      console.log(`SyncService: Download complete for ${path} (revision ${revision})`);
+      console.log(`SyncService: Download complete for ${path} (commit ${commit})`);
     } catch (error) {
       console.error(`SyncService: Failed to download ${path}`, error);
       throw error;
@@ -239,7 +485,25 @@ var _SyncService = class _SyncService {
     this.eventRefs.push(deleteRef);
     console.log("SyncService: File watcher setup complete (modify, create, delete)");
   }
+  /**
+   * Mark user as active (typing) - pauses polling until debounce interval passes
+   */
+  markUserActive() {
+    this.isUserActive = true;
+    if (this.activityTimer) {
+      clearTimeout(this.activityTimer);
+    }
+    const debounceMs = this.settings.debounceInterval * 1e3;
+    this.activityTimer = setTimeout(() => {
+      this.isUserActive = false;
+      console.log("SyncService: User idle, resuming sync");
+    }, debounceMs);
+  }
   debouncedUpload(path) {
+    this.markUserActive();
+    if (!this.settings.autoSync) {
+      return;
+    }
     const existingTimer = this.debounceTimers.get(path);
     if (existingTimer) {
       console.log(`SyncService: Debounce reset for: ${path}`);
@@ -260,52 +524,15 @@ var _SyncService = class _SyncService {
   }
   async handleFileDelete(path) {
     console.log(`SyncService: Handling file deletion: ${path}`);
-    const hadState = !!this.syncState[path];
-    delete this.syncState[path];
-    await this.saveSyncState();
-    console.log(`SyncService: File ${path} removed from sync state (had previous state: ${hadState})`);
-  }
-  async handleConflict(originalPath) {
-    console.log(`SyncService: Handling conflict for: ${originalPath}`);
-    try {
-      const lastDot = originalPath.lastIndexOf(".");
-      const ext = lastDot !== -1 ? originalPath.substring(lastDot) : "";
-      const base = lastDot !== -1 ? originalPath.substring(0, lastDot) : originalPath;
-      const conflictPath = `${base} (Conflict)${ext}`;
-      console.log(`SyncService: Conflict file will be saved as: ${conflictPath}`);
-      const url = `${this.getVaultBaseUrl()}/file/${encodeURIComponent(originalPath)}`;
-      console.log(`SyncService: Downloading server version from: ${url}`);
-      const response = await fetch(url);
-      if (!response.ok) {
-        console.error(`SyncService: Failed to download conflict file, status: ${response.status}`);
-        throw new Error(`Failed to download conflict file: ${response.status}`);
-      }
-      const content = await response.arrayBuffer();
-      const revision = parseInt(response.headers.get("X-File-Revision") || "1", 10);
-      const hash = response.headers.get("X-File-Hash") || "";
-      console.log(`SyncService: Server version downloaded, size: ${content.byteLength}, revision: ${revision}`);
-      const existingConflict = this.vault.getAbstractFileByPath(conflictPath);
-      if (existingConflict instanceof import_obsidian.TFile) {
-        console.log(`SyncService: Updating existing conflict file: ${conflictPath}`);
-        await this.vault.modifyBinary(existingConflict, content);
+    if (this.syncState[path]) {
+      if (this.settings.autoSync) {
+        await this.deleteFromServer(path);
+        console.log(`SyncService: Deleted ${path} from server`);
+        delete this.syncState[path];
+        await this.saveSyncState();
       } else {
-        const folderPath = conflictPath.substring(0, conflictPath.lastIndexOf("/"));
-        if (folderPath && !this.vault.getAbstractFileByPath(folderPath)) {
-          console.log(`SyncService: Creating parent folder for conflict: ${folderPath}`);
-          await this.vault.createFolder(folderPath);
-        }
-        console.log(`SyncService: Creating conflict file: ${conflictPath}`);
-        await this.vault.createBinary(conflictPath, content);
+        console.log(`SyncService: File ${path} deleted locally, marking for deletion on next manual sync`);
       }
-      this.syncState[originalPath] = { hash, revision };
-      await this.saveSyncState();
-      console.log(`SyncService: Updated sync state for ${originalPath} to revision ${revision}`);
-      const fileName = originalPath.substring(originalPath.lastIndexOf("/") + 1);
-      new import_obsidian.Notice(`Scion Sync: Conflict in "${fileName}". Remote version saved as "${fileName.replace(ext, ` (Conflict)${ext}`)}"`);
-      console.log(`SyncService: Conflict resolved for ${originalPath} \u2192 ${conflictPath}`);
-    } catch (error) {
-      console.error(`SyncService: Failed to handle conflict for ${originalPath}`, error);
-      new import_obsidian.Notice(`Scion Sync: Failed to resolve conflict for ${originalPath}`);
     }
   }
   async computeLocalHash(path) {
@@ -331,7 +558,7 @@ var _SyncService = class _SyncService {
       throw new Error(`Failed to fetch manifest: ${response.status}`);
     }
     const manifest = await response.json();
-    console.log(`SyncService: Manifest fetched, ${((_a = manifest.files) == null ? void 0 : _a.length) || 0} files`);
+    console.log(`SyncService: Manifest fetched, ${((_a = manifest.files) == null ? void 0 : _a.length) || 0} files, head: ${manifest.head_commit}`);
     return manifest;
   }
   async saveSyncState() {
@@ -346,12 +573,35 @@ var _SyncService = class _SyncService {
     }
     return btoa(binary);
   }
+  base64ToArrayBuffer(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
+  }
   arrayBufferToHex(buffer) {
     const bytes = new Uint8Array(buffer);
     return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
   }
+  /**
+   * Get sync statistics
+   */
+  getStats() {
+    return {
+      trackedFiles: Object.keys(this.syncState).length,
+      lastCommit: this.lastHeadCommit,
+      pendingConflicts: this.pendingConflicts.length
+    };
+  }
   destroy() {
     console.log("SyncService: Destroying...");
+    this.stopPolling();
+    if (this.activityTimer) {
+      clearTimeout(this.activityTimer);
+      this.activityTimer = null;
+    }
     const timerCount = this.debounceTimers.size;
     for (const timer of this.debounceTimers.values()) {
       clearTimeout(timer);
@@ -372,7 +622,12 @@ var SyncService = _SyncService;
 
 // src/main.ts
 var DEFAULT_SETTINGS = {
-  serverUrl: "http://localhost:3000"
+  serverUrl: "http://localhost:3000",
+  pollInterval: 30,
+  autoSync: true,
+  syncOnStartup: true,
+  conflictMode: "merge",
+  debounceInterval: 3
 };
 var ScionSyncPlugin = class extends import_obsidian2.Plugin {
   constructor() {
@@ -389,11 +644,15 @@ var ScionSyncPlugin = class extends import_obsidian2.Plugin {
     console.log("ScionSyncPlugin: Plugin loaded", {
       serverUrl: this.settings.serverUrl,
       vaultName,
+      pollInterval: this.settings.pollInterval,
       syncStateEntries: Object.keys(this.syncState).length
     });
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("scion-sync-status");
-    this.updateStatusBar("idle");
+    this.statusBarItem.setText("Scion: Ready");
+    this.statusBarItem.addEventListener("click", () => {
+      new SyncStatusModal(this.app, this).open();
+    });
     console.log("ScionSyncPlugin: Status bar item added");
     this.syncService = new SyncService(
       this.app,
@@ -408,7 +667,12 @@ var ScionSyncPlugin = class extends import_obsidian2.Plugin {
     this.syncService.setStatusCallback((status, message) => {
       this.updateStatusBar(status, message);
     });
-    console.log("ScionSyncPlugin: Status callback registered");
+    this.syncService.setConflictCallback((conflict) => {
+      if (this.settings.conflictMode === "ask") {
+        new ConflictModal(this.app, this, conflict).open();
+      }
+    });
+    console.log("ScionSyncPlugin: Callbacks registered");
     console.log("ScionSyncPlugin: Starting initial sync...");
     this.syncService.initialize();
     this.addSettingTab(new ScionSyncSettingTab(this.app, this));
@@ -428,7 +692,39 @@ var ScionSyncPlugin = class extends import_obsidian2.Plugin {
         await ((_a = this.syncService) == null ? void 0 : _a.syncAll());
       }
     });
-    console.log("ScionSyncPlugin: Command registered");
+    this.addCommand({
+      id: "toggle-auto-sync",
+      name: "Toggle Auto-Sync",
+      callback: async () => {
+        var _a;
+        this.settings.autoSync = !this.settings.autoSync;
+        await this.saveSettings();
+        (_a = this.syncService) == null ? void 0 : _a.updateSettings(this.settings);
+        const status = this.settings.autoSync ? "enabled" : "disabled";
+        console.log(`ScionSyncPlugin: Auto-sync ${status}`);
+      }
+    });
+    this.addCommand({
+      id: "show-sync-status",
+      name: "Show Sync Status",
+      callback: () => {
+        new SyncStatusModal(this.app, this).open();
+      }
+    });
+    this.addCommand({
+      id: "resolve-conflicts",
+      name: "Resolve All Conflicts",
+      callback: () => {
+        var _a;
+        const conflicts = ((_a = this.syncService) == null ? void 0 : _a.getPendingConflicts()) || [];
+        if (conflicts.length === 0) {
+          console.log("ScionSyncPlugin: No pending conflicts");
+          return;
+        }
+        new ConflictModal(this.app, this, conflicts[0]).open();
+      }
+    });
+    console.log("ScionSyncPlugin: Commands registered");
     console.log("ScionSyncPlugin: onload() complete");
   }
   onunload() {
@@ -444,16 +740,22 @@ var ScionSyncPlugin = class extends import_obsidian2.Plugin {
     this.syncState = (data == null ? void 0 : data.syncState) || {};
     console.log("ScionSyncPlugin: Settings loaded", {
       serverUrl: this.settings.serverUrl,
+      pollInterval: this.settings.pollInterval,
+      autoSync: this.settings.autoSync,
       syncStateEntries: Object.keys(this.syncState).length
     });
   }
   async saveSettings() {
     console.log("ScionSyncPlugin: Saving settings...", {
       serverUrl: this.settings.serverUrl,
-      syncStateEntries: Object.keys(this.syncState).length
+      pollInterval: this.settings.pollInterval,
+      autoSync: this.settings.autoSync
     });
     await this.saveData({ settings: this.settings, syncState: this.syncState });
     console.log("ScionSyncPlugin: Settings saved");
+  }
+  getSyncService() {
+    return this.syncService;
   }
   updateStatusBar(status, message) {
     console.log(`ScionSyncPlugin: updateStatusBar called with status: '${status}'`, message ? { message } : "");
@@ -484,7 +786,7 @@ var ScionSyncPlugin = class extends import_obsidian2.Plugin {
         break;
       case "error":
         this.statusBarItem.addClass("error");
-        this.statusBarItem.setText(`Scion: Sync failed`);
+        this.statusBarItem.setText(`Scion: Error`);
         this.statusBarItem.setAttr("title", message || "Unknown error");
         console.log("ScionSyncPlugin: Status bar set to error", { message });
         break;
@@ -498,9 +800,11 @@ var ScionSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
     console.log("ScionSyncSettingTab: Constructor called");
   }
   display() {
+    var _a, _b;
     console.log("ScionSyncSettingTab: Displaying settings");
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.createEl("h2", { text: "Scion Sync Settings" });
     new import_obsidian2.Setting(containerEl).setName("Server URL").setDesc("The URL of your Scion sync server (e.g., http://192.168.1.100:3000)").addText(
       (text) => text.setPlaceholder("http://localhost:3000").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
         console.log(`ScionSyncSettingTab: Server URL changed to: ${value}`);
@@ -508,5 +812,157 @@ var ScionSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+    new import_obsidian2.Setting(containerEl).setName("Sync interval").setDesc(`Check for changes every ${this.plugin.settings.pollInterval} seconds`).addSlider(
+      (slider) => slider.setLimits(5, 120, 5).setValue(this.plugin.settings.pollInterval).setDynamicTooltip().onChange(async (value) => {
+        var _a2;
+        console.log(`ScionSyncSettingTab: Poll interval changed to: ${value}s`);
+        this.plugin.settings.pollInterval = value;
+        await this.plugin.saveSettings();
+        (_a2 = this.plugin.getSyncService()) == null ? void 0 : _a2.updateSettings(this.plugin.settings);
+        this.display();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Typing debounce").setDesc(`Pause sync for ${this.plugin.settings.debounceInterval} seconds after typing stops`).addSlider(
+      (slider) => slider.setLimits(1, 10, 1).setValue(this.plugin.settings.debounceInterval).setDynamicTooltip().onChange(async (value) => {
+        var _a2;
+        console.log(`ScionSyncSettingTab: Debounce interval changed to: ${value}s`);
+        this.plugin.settings.debounceInterval = value;
+        await this.plugin.saveSettings();
+        (_a2 = this.plugin.getSyncService()) == null ? void 0 : _a2.updateSettings(this.plugin.settings);
+        this.display();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Auto-sync").setDesc("Automatically sync changes in background").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
+        var _a2;
+        console.log(`ScionSyncSettingTab: Auto-sync changed to: ${value}`);
+        this.plugin.settings.autoSync = value;
+        await this.plugin.saveSettings();
+        (_a2 = this.plugin.getSyncService()) == null ? void 0 : _a2.updateSettings(this.plugin.settings);
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Sync on startup").setDesc("Perform full sync when Obsidian opens").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async (value) => {
+        console.log(`ScionSyncSettingTab: Sync on startup changed to: ${value}`);
+        this.plugin.settings.syncOnStartup = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("Conflict resolution").setDesc("How to handle sync conflicts").addDropdown(
+      (dropdown) => dropdown.addOption("merge", "Auto-merge (show markers if needed)").addOption("ask", "Ask me each time").addOption("local", "Always keep local version").addOption("remote", "Always keep server version").setValue(this.plugin.settings.conflictMode).onChange(async (value) => {
+        console.log(`ScionSyncSettingTab: Conflict mode changed to: ${value}`);
+        this.plugin.settings.conflictMode = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    containerEl.createEl("h3", { text: "Actions" });
+    new import_obsidian2.Setting(containerEl).setName("Sync now").setDesc("Manually trigger a full sync").addButton(
+      (btn) => btn.setButtonText("Sync Now").setCta().onClick(async () => {
+        var _a2;
+        console.log("ScionSyncSettingTab: Manual sync triggered");
+        await ((_a2 = this.plugin.getSyncService()) == null ? void 0 : _a2.syncAll());
+      })
+    );
+    const stats = (_a = this.plugin.getSyncService()) == null ? void 0 : _a.getStats();
+    if (stats) {
+      containerEl.createEl("h3", { text: "Status" });
+      const statusEl = containerEl.createDiv({ cls: "scion-sync-status-info" });
+      statusEl.createEl("p", { text: `Tracked files: ${stats.trackedFiles}` });
+      statusEl.createEl("p", { text: `Last commit: ${((_b = stats.lastCommit) == null ? void 0 : _b.substring(0, 8)) || "None"}` });
+      statusEl.createEl("p", { text: `Pending conflicts: ${stats.pendingConflicts}` });
+    }
+  }
+};
+var SyncStatusModal = class extends import_obsidian2.Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+  onOpen() {
+    var _a, _b;
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Scion Sync Status" });
+    const stats = (_a = this.plugin.getSyncService()) == null ? void 0 : _a.getStats();
+    const infoEl = contentEl.createDiv({ cls: "scion-status-info" });
+    infoEl.createEl("p", { text: `Server: ${this.plugin.settings.serverUrl}` });
+    infoEl.createEl("p", { text: `Vault: ${this.app.vault.getName()}` });
+    infoEl.createEl("p", { text: `Auto-sync: ${this.plugin.settings.autoSync ? "Enabled" : "Disabled"}` });
+    infoEl.createEl("p", { text: `Poll interval: ${this.plugin.settings.pollInterval}s` });
+    contentEl.createEl("hr");
+    if (stats) {
+      const statsEl = contentEl.createDiv({ cls: "scion-status-stats" });
+      statsEl.createEl("p", { text: `Files tracked: ${stats.trackedFiles}` });
+      statsEl.createEl("p", { text: `Last server commit: ${((_b = stats.lastCommit) == null ? void 0 : _b.substring(0, 8)) || "None"}` });
+      statsEl.createEl("p", { text: `Pending conflicts: ${stats.pendingConflicts}` });
+    }
+    contentEl.createEl("hr");
+    const actionsEl = contentEl.createDiv({ cls: "scion-status-actions" });
+    new import_obsidian2.Setting(actionsEl).addButton(
+      (btn) => btn.setButtonText("Sync Now").setCta().onClick(async () => {
+        var _a2;
+        this.close();
+        await ((_a2 = this.plugin.getSyncService()) == null ? void 0 : _a2.syncAll());
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("Settings").onClick(() => {
+        this.close();
+        this.app.setting.open();
+        this.app.setting.openTabById("scion-sync");
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("Close").onClick(() => {
+        this.close();
+      })
+    );
+  }
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
+  }
+};
+var ConflictModal = class extends import_obsidian2.Modal {
+  constructor(app, plugin, conflict) {
+    super(app);
+    this.plugin = plugin;
+    this.conflict = conflict;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("scion-conflict-modal");
+    contentEl.createEl("h2", { text: "Sync Conflict" });
+    contentEl.createEl("p", { text: `File: ${this.conflict.path}` });
+    contentEl.createEl("p", {
+      text: "The file was modified both locally and on the server.",
+      cls: "scion-conflict-desc"
+    });
+    contentEl.createEl("h3", { text: "Merged Content (with conflict markers):" });
+    const previewEl = contentEl.createEl("pre", { cls: "scion-conflict-preview" });
+    previewEl.createEl("code", { text: this.conflict.mergedContent.substring(0, 500) + "..." });
+    contentEl.createEl("hr");
+    new import_obsidian2.Setting(contentEl).setName("Choose resolution").addButton(
+      (btn) => btn.setButtonText("Keep Local").setWarning().onClick(async () => {
+        var _a;
+        await ((_a = this.plugin.getSyncService()) == null ? void 0 : _a.resolveConflict(this.conflict.path, "local"));
+        this.close();
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("Keep Server").setWarning().onClick(async () => {
+        var _a;
+        await ((_a = this.plugin.getSyncService()) == null ? void 0 : _a.resolveConflict(this.conflict.path, "remote"));
+        this.close();
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("Use Merged (edit markers)").setCta().onClick(async () => {
+        var _a;
+        await ((_a = this.plugin.getSyncService()) == null ? void 0 : _a.resolveConflict(this.conflict.path, "merged", this.conflict.mergedContent));
+        this.close();
+      })
+    );
+  }
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
   }
 };
