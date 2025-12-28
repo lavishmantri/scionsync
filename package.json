@@ -1,7 +1,7 @@
 {
   "name": "scion-sync",
   "version": "1.0.0",
-  "description": "Self-hosted Obsidian vault sync plugin",
+  "description": "Self-hosted Obsidian vault sync scionsync",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",

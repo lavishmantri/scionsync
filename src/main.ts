@@ -22,7 +22,7 @@ export default class ScionSyncPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    console.log('Scion Sync plugin loaded');
+    console.log('Scion Sync scionsync loaded');
 
     // Initialize sync service
     this.syncService = new SyncService(
@@ -60,7 +60,7 @@ export default class ScionSyncPlugin extends Plugin {
 
   onunload() {
     this.syncService?.destroy();
-    console.log('Scion Sync plugin unloaded');
+    console.log('Scion Sync scionsync unloaded');
   }
 
   async loadSettings() {
