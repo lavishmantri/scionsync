@@ -20,6 +20,8 @@ interface ScionSyncSettings {
   serverUrl: string;
 }
 
+export type SyncStatus = 'idle' | 'syncing' | 'success' | 'error';
+
 export class SyncService {
   private app: App;
   private vault: Vault;
@@ -28,6 +30,7 @@ export class SyncService {
   private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private eventRefs: EventRef[] = [];
   private saveDataFn: (data: unknown) => Promise<void>;
+  private statusCallback: ((status: SyncStatus, message?: string) => void) | null = null;
   private isSyncing = false;
 
   private static readonly DEBOUNCE_MS = 2000;
@@ -43,6 +46,14 @@ export class SyncService {
     this.settings = settings;
     this.syncState = syncState || {};
     this.saveDataFn = saveDataFn;
+  }
+
+  setStatusCallback(callback: (status: SyncStatus, message?: string) => void): void {
+    this.statusCallback = callback;
+  }
+
+  private updateStatus(status: SyncStatus, message?: string): void {
+    this.statusCallback?.(status, message);
   }
 
   async initialize(): Promise<void> {
@@ -65,6 +76,7 @@ export class SyncService {
     }
 
     this.isSyncing = true;
+    this.updateStatus('syncing');
 
     try {
       // Fetch server manifest
@@ -109,9 +121,11 @@ export class SyncService {
         }
       }
 
+      this.updateStatus('success');
       new Notice('Scion Sync: Sync complete');
     } catch (error) {
       console.error('SyncService: Sync failed', error);
+      this.updateStatus('error', error instanceof Error ? error.message : 'Unknown error');
       new Notice('Scion Sync: Sync failed - check console for details');
     } finally {
       this.isSyncing = false;

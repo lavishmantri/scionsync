@@ -1,1 +1,21 @@
-/* Scion Sync scionsync Styles */
+/* Scion Sync Plugin Styles */
+
+/* Status bar indicator */
+.scion-sync-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.scion-sync-status.syncing {
+  color: var(--text-muted);
+}
+
+.scion-sync-status.success {
+  color: var(--color-green);
+}
+
+.scion-sync-status.error {
+  color: var(--color-red);
+  cursor: help;
+}

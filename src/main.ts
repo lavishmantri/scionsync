@@ -1,5 +1,5 @@
 import { App, Plugin, PluginSettingTab, Setting } from 'obsidian';
-import { SyncService } from './sync-service';
+import { SyncService, SyncStatus } from './sync-service';
 
 interface ScionSyncSettings {
   serverUrl: string;
@@ -18,11 +18,17 @@ export default class ScionSyncPlugin extends Plugin {
   settings: ScionSyncSettings = DEFAULT_SETTINGS;
   private syncService: SyncService | null = null;
   private syncState: Record<string, { hash: string; revision: number }> = {};
+  private statusBarItem: HTMLElement | null = null;
 
   async onload() {
     await this.loadSettings();
 
     console.log('Scion Sync scionsync loaded');
+
+    // Add status bar item
+    this.statusBarItem = this.addStatusBarItem();
+    this.statusBarItem.addClass('scion-sync-status');
+    this.updateStatusBar('idle');
 
     // Initialize sync service
     this.syncService = new SyncService(
@@ -34,6 +40,11 @@ export default class ScionSyncPlugin extends Plugin {
         await this.saveData({ settings: this.settings, syncState: this.syncState });
       }
     );
+
+    // Register status callback
+    this.syncService.setStatusCallback((status, message) => {
+      this.updateStatusBar(status, message);
+    });
 
     // Initialize sync on startup (async, don't block plugin load)
     this.syncService.initialize();
@@ -71,6 +82,37 @@ export default class ScionSyncPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData({ settings: this.settings, syncState: this.syncState });
+  }
+
+  private updateStatusBar(status: SyncStatus, message?: string): void {
+    if (!this.statusBarItem) return;
+
+    // Remove all status classes
+    this.statusBarItem.removeClass('syncing', 'success', 'error');
+
+    // Update content and class based on status
+    switch (status) {
+      case 'idle':
+        this.statusBarItem.setText('Scion: Synced');
+        break;
+      case 'syncing':
+        this.statusBarItem.addClass('syncing');
+        this.statusBarItem.setText('Scion: Syncing...');
+        break;
+      case 'success':
+        this.statusBarItem.addClass('success');
+        this.statusBarItem.setText('Scion: Synced');
+        // Fade back to idle after 3 seconds
+        setTimeout(() => {
+          this.statusBarItem?.removeClass('success');
+        }, 3000);
+        break;
+      case 'error':
+        this.statusBarItem.addClass('error');
+        this.statusBarItem.setText(`Scion: Sync failed`);
+        this.statusBarItem.setAttr('title', message || 'Unknown error');
+        break;
+    }
   }
 }
 
