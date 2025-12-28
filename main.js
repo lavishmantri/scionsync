@@ -32,7 +32,7 @@ var import_obsidian2 = require("obsidian");
 // src/sync-service.ts
 var import_obsidian = require("obsidian");
 var _SyncService = class _SyncService {
-  constructor(app, settings, syncState, saveDataFn) {
+  constructor(app, settings, vaultName, syncState, saveDataFn) {
     this.syncState = {};
     this.debounceTimers = /* @__PURE__ */ new Map();
     this.eventRefs = [];
@@ -41,14 +41,28 @@ var _SyncService = class _SyncService {
     this.app = app;
     this.vault = app.vault;
     this.settings = settings;
+    this.vaultName = vaultName;
     this.syncState = syncState || {};
     this.saveDataFn = saveDataFn;
+    console.log("SyncService: Constructor called", {
+      serverUrl: settings.serverUrl,
+      vaultName: this.vaultName,
+      existingSyncStateCount: Object.keys(this.syncState).length
+    });
+  }
+  /**
+   * Get the base URL for vault-specific API calls
+   */
+  getVaultBaseUrl() {
+    return `${this.settings.serverUrl}/vault/${encodeURIComponent(this.vaultName)}`;
   }
   setStatusCallback(callback) {
     this.statusCallback = callback;
+    console.log("SyncService: Status callback registered");
   }
   updateStatus(status, message) {
     var _a;
+    console.log(`SyncService: Status changed to '${status}'`, message ? { message } : "");
     (_a = this.statusCallback) == null ? void 0 : _a.call(this, status, message);
   }
   async initialize() {
@@ -67,13 +81,17 @@ var _SyncService = class _SyncService {
       console.log("SyncService: Sync already in progress, skipping");
       return;
     }
+    console.log("SyncService: Starting full sync...");
     this.isSyncing = true;
     this.updateStatus("syncing");
     try {
+      console.log("SyncService: Fetching server manifest...");
       const manifest = await this.fetchManifest();
       const serverFiles = new Map(manifest.files.map((f) => [f.path, f]));
+      console.log(`SyncService: Server has ${serverFiles.size} files`);
       const localFiles = this.vault.getFiles();
       const localPaths = new Set(localFiles.map((f) => f.path));
+      console.log(`SyncService: Local vault has ${localFiles.length} files`);
       for (const [serverPath, serverRecord] of serverFiles) {
         const localState = this.syncState[serverPath];
         if (!localPaths.has(serverPath)) {
@@ -98,6 +116,7 @@ var _SyncService = class _SyncService {
           }
         }
       }
+      console.log("SyncService: Full sync completed successfully");
       this.updateStatus("success");
       new import_obsidian.Notice("Scion Sync: Sync complete");
     } catch (error) {
@@ -106,10 +125,12 @@ var _SyncService = class _SyncService {
       new import_obsidian.Notice("Scion Sync: Sync failed - check console for details");
     } finally {
       this.isSyncing = false;
+      console.log("SyncService: Sync lock released");
     }
   }
   async uploadFile(path) {
     var _a;
+    console.log(`SyncService: uploadFile called for: ${path}`);
     const file = this.vault.getAbstractFileByPath(path);
     if (!(file instanceof import_obsidian.TFile)) {
       console.warn(`SyncService: Cannot upload, file not found: ${path}`);
@@ -118,9 +139,11 @@ var _SyncService = class _SyncService {
     try {
       const content = await this.vault.readBinary(file);
       const base64Content = this.arrayBufferToBase64(content);
+      console.log(`SyncService: Read file ${path}, size: ${content.byteLength} bytes`);
       const localState = this.syncState[path];
       const clientRevision = (_a = localState == null ? void 0 : localState.revision) != null ? _a : null;
-      const response = await fetch(`${this.settings.serverUrl}/sync`, {
+      console.log(`SyncService: Upload ${path} with client_revision: ${clientRevision}`);
+      const response = await fetch(`${this.getVaultBaseUrl()}/sync`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -129,6 +152,7 @@ var _SyncService = class _SyncService {
           client_revision: clientRevision
         })
       });
+      console.log(`SyncService: Upload response status: ${response.status}`);
       if (response.status === 409) {
         const data = await response.json();
         console.warn(`SyncService: Conflict detected for ${path}`, data);
@@ -136,9 +160,12 @@ var _SyncService = class _SyncService {
         return;
       }
       if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`SyncService: Upload failed for ${path}`, { status: response.status, body: errorText });
         throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
       }
       const result = await response.json();
+      console.log(`SyncService: Upload successful for ${path}`, { hash: result.hash, revision: result.revision });
       this.syncState[path] = {
         hash: result.hash,
         revision: result.revision
@@ -151,59 +178,77 @@ var _SyncService = class _SyncService {
     }
   }
   async downloadFile(path) {
+    console.log(`SyncService: downloadFile called for: ${path}`);
     try {
-      const response = await fetch(`${this.settings.serverUrl}/file/${encodeURIComponent(path)}`);
+      const url = `${this.getVaultBaseUrl()}/file/${encodeURIComponent(path)}`;
+      console.log(`SyncService: Fetching from: ${url}`);
+      const response = await fetch(url);
+      console.log(`SyncService: Download response status: ${response.status}`);
       if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`SyncService: Download failed for ${path}`, { status: response.status, body: errorText });
         throw new Error(`Download failed: ${response.status} ${response.statusText}`);
       }
       const content = await response.arrayBuffer();
       const revision = parseInt(response.headers.get("X-File-Revision") || "1", 10);
       const hash = response.headers.get("X-File-Hash") || "";
+      console.log(`SyncService: Downloaded ${path}, size: ${content.byteLength} bytes, revision: ${revision}`);
       const existingFile = this.vault.getAbstractFileByPath(path);
       if (existingFile instanceof import_obsidian.TFile) {
+        console.log(`SyncService: Updating existing file: ${path}`);
         await this.vault.modifyBinary(existingFile, content);
       } else {
         const folderPath = path.substring(0, path.lastIndexOf("/"));
         if (folderPath && !this.vault.getAbstractFileByPath(folderPath)) {
+          console.log(`SyncService: Creating parent folder: ${folderPath}`);
           await this.vault.createFolder(folderPath);
         }
+        console.log(`SyncService: Creating new file: ${path}`);
         await this.vault.createBinary(path, content);
       }
       this.syncState[path] = { hash, revision };
       await this.saveSyncState();
-      console.log(`SyncService: Downloaded ${path} (revision ${revision})`);
+      console.log(`SyncService: Download complete for ${path} (revision ${revision})`);
     } catch (error) {
       console.error(`SyncService: Failed to download ${path}`, error);
       throw error;
     }
   }
   setupFileWatcher() {
+    console.log("SyncService: Setting up file watchers...");
     const modifyRef = this.vault.on("modify", (file) => {
       if (file instanceof import_obsidian.TFile) {
+        console.log(`SyncService: File modified event: ${file.path}`);
         this.debouncedUpload(file.path);
       }
     });
     this.eventRefs.push(modifyRef);
     const createRef = this.vault.on("create", (file) => {
       if (file instanceof import_obsidian.TFile) {
+        console.log(`SyncService: File created event: ${file.path}`);
         this.debouncedUpload(file.path);
       }
     });
     this.eventRefs.push(createRef);
     const deleteRef = this.vault.on("delete", (file) => {
       if (file instanceof import_obsidian.TFile) {
+        console.log(`SyncService: File deleted event: ${file.path}`);
         this.handleFileDelete(file.path);
       }
     });
     this.eventRefs.push(deleteRef);
-    console.log("SyncService: File watcher setup complete");
+    console.log("SyncService: File watcher setup complete (modify, create, delete)");
   }
   debouncedUpload(path) {
     const existingTimer = this.debounceTimers.get(path);
     if (existingTimer) {
+      console.log(`SyncService: Debounce reset for: ${path}`);
       clearTimeout(existingTimer);
+    } else {
+      console.log(`SyncService: Debounce started for: ${path} (${_SyncService.DEBOUNCE_MS}ms)`);
     }
     const timer = setTimeout(async () => {
+      console.log(`SyncService: Debounce timer fired for: ${path}`);
       this.debounceTimers.delete(path);
       try {
         await this.uploadFile(path);
@@ -214,37 +259,47 @@ var _SyncService = class _SyncService {
     this.debounceTimers.set(path, timer);
   }
   async handleFileDelete(path) {
-    console.log(`SyncService: File deleted: ${path}`);
+    console.log(`SyncService: Handling file deletion: ${path}`);
+    const hadState = !!this.syncState[path];
     delete this.syncState[path];
     await this.saveSyncState();
+    console.log(`SyncService: File ${path} removed from sync state (had previous state: ${hadState})`);
   }
   async handleConflict(originalPath) {
+    console.log(`SyncService: Handling conflict for: ${originalPath}`);
     try {
       const lastDot = originalPath.lastIndexOf(".");
       const ext = lastDot !== -1 ? originalPath.substring(lastDot) : "";
       const base = lastDot !== -1 ? originalPath.substring(0, lastDot) : originalPath;
       const conflictPath = `${base} (Conflict)${ext}`;
-      const response = await fetch(
-        `${this.settings.serverUrl}/file/${encodeURIComponent(originalPath)}`
-      );
+      console.log(`SyncService: Conflict file will be saved as: ${conflictPath}`);
+      const url = `${this.getVaultBaseUrl()}/file/${encodeURIComponent(originalPath)}`;
+      console.log(`SyncService: Downloading server version from: ${url}`);
+      const response = await fetch(url);
       if (!response.ok) {
+        console.error(`SyncService: Failed to download conflict file, status: ${response.status}`);
         throw new Error(`Failed to download conflict file: ${response.status}`);
       }
       const content = await response.arrayBuffer();
       const revision = parseInt(response.headers.get("X-File-Revision") || "1", 10);
       const hash = response.headers.get("X-File-Hash") || "";
+      console.log(`SyncService: Server version downloaded, size: ${content.byteLength}, revision: ${revision}`);
       const existingConflict = this.vault.getAbstractFileByPath(conflictPath);
       if (existingConflict instanceof import_obsidian.TFile) {
+        console.log(`SyncService: Updating existing conflict file: ${conflictPath}`);
         await this.vault.modifyBinary(existingConflict, content);
       } else {
         const folderPath = conflictPath.substring(0, conflictPath.lastIndexOf("/"));
         if (folderPath && !this.vault.getAbstractFileByPath(folderPath)) {
+          console.log(`SyncService: Creating parent folder for conflict: ${folderPath}`);
           await this.vault.createFolder(folderPath);
         }
+        console.log(`SyncService: Creating conflict file: ${conflictPath}`);
         await this.vault.createBinary(conflictPath, content);
       }
       this.syncState[originalPath] = { hash, revision };
       await this.saveSyncState();
+      console.log(`SyncService: Updated sync state for ${originalPath} to revision ${revision}`);
       const fileName = originalPath.substring(originalPath.lastIndexOf("/") + 1);
       new import_obsidian.Notice(`Scion Sync: Conflict in "${fileName}". Remote version saved as "${fileName.replace(ext, ` (Conflict)${ext}`)}"`);
       console.log(`SyncService: Conflict resolved for ${originalPath} \u2192 ${conflictPath}`);
@@ -254,22 +309,33 @@ var _SyncService = class _SyncService {
     }
   }
   async computeLocalHash(path) {
+    console.log(`SyncService: Computing hash for: ${path}`);
     const file = this.vault.getAbstractFileByPath(path);
     if (!(file instanceof import_obsidian.TFile)) {
+      console.error(`SyncService: Cannot compute hash, file not found: ${path}`);
       throw new Error(`File not found: ${path}`);
     }
     const content = await this.vault.readBinary(file);
     const hashBuffer = await crypto.subtle.digest("SHA-256", content);
-    return this.arrayBufferToHex(hashBuffer);
+    const hash = this.arrayBufferToHex(hashBuffer);
+    console.log(`SyncService: Hash computed for ${path}: ${hash.substring(0, 16)}...`);
+    return hash;
   }
   async fetchManifest() {
-    const response = await fetch(`${this.settings.serverUrl}/manifest`);
+    var _a;
+    const url = `${this.getVaultBaseUrl()}/manifest`;
+    console.log(`SyncService: Fetching manifest from: ${url}`);
+    const response = await fetch(url);
     if (!response.ok) {
+      console.error(`SyncService: Manifest fetch failed, status: ${response.status}`);
       throw new Error(`Failed to fetch manifest: ${response.status}`);
     }
-    return response.json();
+    const manifest = await response.json();
+    console.log(`SyncService: Manifest fetched, ${((_a = manifest.files) == null ? void 0 : _a.length) || 0} files`);
+    return manifest;
   }
   async saveSyncState() {
+    console.log(`SyncService: Saving sync state (${Object.keys(this.syncState).length} entries)`);
     await this.saveDataFn({ syncState: this.syncState });
   }
   arrayBufferToBase64(buffer) {
@@ -285,14 +351,19 @@ var _SyncService = class _SyncService {
     return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
   }
   destroy() {
+    console.log("SyncService: Destroying...");
+    const timerCount = this.debounceTimers.size;
     for (const timer of this.debounceTimers.values()) {
       clearTimeout(timer);
     }
     this.debounceTimers.clear();
+    console.log(`SyncService: Cleared ${timerCount} debounce timers`);
+    const refCount = this.eventRefs.length;
     for (const ref of this.eventRefs) {
       this.vault.offref(ref);
     }
     this.eventRefs = [];
+    console.log(`SyncService: Unregistered ${refCount} event listeners`);
     console.log("SyncService: Destroyed");
   }
 };
@@ -312,14 +383,22 @@ var ScionSyncPlugin = class extends import_obsidian2.Plugin {
     this.statusBarItem = null;
   }
   async onload() {
+    console.log("ScionSyncPlugin: onload() starting...");
     await this.loadSettings();
-    console.log("Scion Sync scionsync loaded");
+    const vaultName = this.app.vault.getName();
+    console.log("ScionSyncPlugin: Plugin loaded", {
+      serverUrl: this.settings.serverUrl,
+      vaultName,
+      syncStateEntries: Object.keys(this.syncState).length
+    });
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass("scion-sync-status");
     this.updateStatusBar("idle");
+    console.log("ScionSyncPlugin: Status bar item added");
     this.syncService = new SyncService(
       this.app,
       this.settings,
+      vaultName,
       this.syncState,
       async (data) => {
         this.syncState = data.syncState;
@@ -329,59 +408,85 @@ var ScionSyncPlugin = class extends import_obsidian2.Plugin {
     this.syncService.setStatusCallback((status, message) => {
       this.updateStatusBar(status, message);
     });
+    console.log("ScionSyncPlugin: Status callback registered");
+    console.log("ScionSyncPlugin: Starting initial sync...");
     this.syncService.initialize();
     this.addSettingTab(new ScionSyncSettingTab(this.app, this));
+    console.log("ScionSyncPlugin: Settings tab added");
     this.addRibbonIcon("refresh-cw", "Scion Sync", async () => {
       var _a;
-      console.log("Manual sync triggered");
+      console.log("ScionSyncPlugin: Manual sync triggered via ribbon icon");
       await ((_a = this.syncService) == null ? void 0 : _a.syncAll());
     });
+    console.log("ScionSyncPlugin: Ribbon icon added");
     this.addCommand({
       id: "sync-now",
       name: "Sync Now",
       callback: async () => {
         var _a;
-        console.log("Sync command executed");
+        console.log("ScionSyncPlugin: Sync command executed");
         await ((_a = this.syncService) == null ? void 0 : _a.syncAll());
       }
     });
+    console.log("ScionSyncPlugin: Command registered");
+    console.log("ScionSyncPlugin: onload() complete");
   }
   onunload() {
     var _a;
+    console.log("ScionSyncPlugin: onunload() starting...");
     (_a = this.syncService) == null ? void 0 : _a.destroy();
-    console.log("Scion Sync scionsync unloaded");
+    console.log("ScionSyncPlugin: Plugin unloaded");
   }
   async loadSettings() {
+    console.log("ScionSyncPlugin: Loading settings...");
     const data = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data == null ? void 0 : data.settings);
     this.syncState = (data == null ? void 0 : data.syncState) || {};
+    console.log("ScionSyncPlugin: Settings loaded", {
+      serverUrl: this.settings.serverUrl,
+      syncStateEntries: Object.keys(this.syncState).length
+    });
   }
   async saveSettings() {
+    console.log("ScionSyncPlugin: Saving settings...", {
+      serverUrl: this.settings.serverUrl,
+      syncStateEntries: Object.keys(this.syncState).length
+    });
     await this.saveData({ settings: this.settings, syncState: this.syncState });
+    console.log("ScionSyncPlugin: Settings saved");
   }
   updateStatusBar(status, message) {
-    if (!this.statusBarItem) return;
+    console.log(`ScionSyncPlugin: updateStatusBar called with status: '${status}'`, message ? { message } : "");
+    if (!this.statusBarItem) {
+      console.warn("ScionSyncPlugin: Status bar item not available");
+      return;
+    }
     this.statusBarItem.removeClass("syncing", "success", "error");
     switch (status) {
       case "idle":
         this.statusBarItem.setText("Scion: Synced");
+        console.log("ScionSyncPlugin: Status bar set to idle");
         break;
       case "syncing":
         this.statusBarItem.addClass("syncing");
         this.statusBarItem.setText("Scion: Syncing...");
+        console.log("ScionSyncPlugin: Status bar set to syncing");
         break;
       case "success":
         this.statusBarItem.addClass("success");
         this.statusBarItem.setText("Scion: Synced");
+        console.log("ScionSyncPlugin: Status bar set to success (will reset in 3s)");
         setTimeout(() => {
           var _a;
           (_a = this.statusBarItem) == null ? void 0 : _a.removeClass("success");
+          console.log("ScionSyncPlugin: Success state cleared");
         }, 3e3);
         break;
       case "error":
         this.statusBarItem.addClass("error");
         this.statusBarItem.setText(`Scion: Sync failed`);
         this.statusBarItem.setAttr("title", message || "Unknown error");
+        console.log("ScionSyncPlugin: Status bar set to error", { message });
         break;
     }
   }
@@ -390,12 +495,15 @@ var ScionSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    console.log("ScionSyncSettingTab: Constructor called");
   }
   display() {
+    console.log("ScionSyncSettingTab: Displaying settings");
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian2.Setting(containerEl).setName("Server URL").setDesc("The URL of your Scion sync server (e.g., http://192.168.1.100:3000)").addText(
       (text) => text.setPlaceholder("http://localhost:3000").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
+        console.log(`ScionSyncSettingTab: Server URL changed to: ${value}`);
         this.plugin.settings.serverUrl = value;
         await this.plugin.saveSettings();
       })

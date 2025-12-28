@@ -21,19 +21,29 @@ export default class ScionSyncPlugin extends Plugin {
   private statusBarItem: HTMLElement | null = null;
 
   async onload() {
+    console.log('ScionSyncPlugin: onload() starting...');
     await this.loadSettings();
 
-    console.log('Scion Sync scionsync loaded');
+    // Get vault name from Obsidian
+    const vaultName = this.app.vault.getName();
+
+    console.log('ScionSyncPlugin: Plugin loaded', {
+      serverUrl: this.settings.serverUrl,
+      vaultName,
+      syncStateEntries: Object.keys(this.syncState).length,
+    });
 
     // Add status bar item
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.addClass('scion-sync-status');
     this.updateStatusBar('idle');
+    console.log('ScionSyncPlugin: Status bar item added');
 
-    // Initialize sync service
+    // Initialize sync service with vault name
     this.syncService = new SyncService(
       this.app,
       this.settings,
+      vaultName,
       this.syncState,
       async (data) => {
         this.syncState = (data as { syncState: typeof this.syncState }).syncState;
@@ -45,47 +55,70 @@ export default class ScionSyncPlugin extends Plugin {
     this.syncService.setStatusCallback((status, message) => {
       this.updateStatusBar(status, message);
     });
+    console.log('ScionSyncPlugin: Status callback registered');
 
     // Initialize sync on startup (async, don't block plugin load)
+    console.log('ScionSyncPlugin: Starting initial sync...');
     this.syncService.initialize();
 
     // Add settings tab
     this.addSettingTab(new ScionSyncSettingTab(this.app, this));
+    console.log('ScionSyncPlugin: Settings tab added');
 
     // Add ribbon icon
     this.addRibbonIcon('refresh-cw', 'Scion Sync', async () => {
-      console.log('Manual sync triggered');
+      console.log('ScionSyncPlugin: Manual sync triggered via ribbon icon');
       await this.syncService?.syncAll();
     });
+    console.log('ScionSyncPlugin: Ribbon icon added');
 
     // Add command
     this.addCommand({
       id: 'sync-now',
       name: 'Sync Now',
       callback: async () => {
-        console.log('Sync command executed');
+        console.log('ScionSyncPlugin: Sync command executed');
         await this.syncService?.syncAll();
       },
     });
+    console.log('ScionSyncPlugin: Command registered');
+
+    console.log('ScionSyncPlugin: onload() complete');
   }
 
   onunload() {
+    console.log('ScionSyncPlugin: onunload() starting...');
     this.syncService?.destroy();
-    console.log('Scion Sync scionsync unloaded');
+    console.log('ScionSyncPlugin: Plugin unloaded');
   }
 
   async loadSettings() {
+    console.log('ScionSyncPlugin: Loading settings...');
     const data = (await this.loadData()) as ScionSyncData | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
     this.syncState = data?.syncState || {};
+    console.log('ScionSyncPlugin: Settings loaded', {
+      serverUrl: this.settings.serverUrl,
+      syncStateEntries: Object.keys(this.syncState).length,
+    });
   }
 
   async saveSettings() {
+    console.log('ScionSyncPlugin: Saving settings...', {
+      serverUrl: this.settings.serverUrl,
+      syncStateEntries: Object.keys(this.syncState).length,
+    });
     await this.saveData({ settings: this.settings, syncState: this.syncState });
+    console.log('ScionSyncPlugin: Settings saved');
   }
 
   private updateStatusBar(status: SyncStatus, message?: string): void {
-    if (!this.statusBarItem) return;
+    console.log(`ScionSyncPlugin: updateStatusBar called with status: '${status}'`, message ? { message } : '');
+
+    if (!this.statusBarItem) {
+      console.warn('ScionSyncPlugin: Status bar item not available');
+      return;
+    }
 
     // Remove all status classes
     this.statusBarItem.removeClass('syncing', 'success', 'error');
@@ -94,23 +127,28 @@ export default class ScionSyncPlugin extends Plugin {
     switch (status) {
       case 'idle':
         this.statusBarItem.setText('Scion: Synced');
+        console.log('ScionSyncPlugin: Status bar set to idle');
         break;
       case 'syncing':
         this.statusBarItem.addClass('syncing');
         this.statusBarItem.setText('Scion: Syncing...');
+        console.log('ScionSyncPlugin: Status bar set to syncing');
         break;
       case 'success':
         this.statusBarItem.addClass('success');
         this.statusBarItem.setText('Scion: Synced');
+        console.log('ScionSyncPlugin: Status bar set to success (will reset in 3s)');
         // Fade back to idle after 3 seconds
         setTimeout(() => {
           this.statusBarItem?.removeClass('success');
+          console.log('ScionSyncPlugin: Success state cleared');
         }, 3000);
         break;
       case 'error':
         this.statusBarItem.addClass('error');
         this.statusBarItem.setText(`Scion: Sync failed`);
         this.statusBarItem.setAttr('title', message || 'Unknown error');
+        console.log('ScionSyncPlugin: Status bar set to error', { message });
         break;
     }
   }
@@ -122,9 +160,11 @@ class ScionSyncSettingTab extends PluginSettingTab {
   constructor(app: App, plugin: ScionSyncPlugin) {
     super(app, plugin);
     this.plugin = plugin;
+    console.log('ScionSyncSettingTab: Constructor called');
   }
 
   display(): void {
+    console.log('ScionSyncSettingTab: Displaying settings');
     const { containerEl } = this;
 
     containerEl.empty();
@@ -137,6 +177,7 @@ class ScionSyncSettingTab extends PluginSettingTab {
           .setPlaceholder('http://localhost:3000')
           .setValue(this.plugin.settings.serverUrl)
           .onChange(async (value) => {
+            console.log(`ScionSyncSettingTab: Server URL changed to: ${value}`);
             this.plugin.settings.serverUrl = value;
             await this.plugin.saveSettings();
           })
