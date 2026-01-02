@@ -1,9 +1,12 @@
 import { App, Modal, Plugin, PluginSettingTab, Setting } from 'obsidian';
-import { SyncService, SyncStatus, ScionSyncSettings } from './sync-service';
+import { SyncService, SyncStatus, ScionSyncSettings, ConnectionState } from './sync-service';
+import { QueuedOperation } from './offline-queue';
 
 interface ScionSyncData {
   settings: ScionSyncSettings;
   syncState: Record<string, { hash: string; commit: string; file_id?: string }>;
+  deviceId?: string;
+  offlineQueue?: QueuedOperation[];
 }
 
 const DEFAULT_SETTINGS: ScionSyncSettings = {
@@ -13,13 +16,17 @@ const DEFAULT_SETTINGS: ScionSyncSettings = {
   syncOnStartup: true,
   conflictMode: 'merge',
   debounceInterval: 3,
+  useWebSocket: true, // Enable real-time sync by default
 };
 
 export default class ScionSyncPlugin extends Plugin {
   settings: ScionSyncSettings = DEFAULT_SETTINGS;
   private syncService: SyncService | null = null;
   private syncState: Record<string, { hash: string; commit: string; file_id?: string }> = {};
+  private deviceId: string = '';
+  private offlineQueue: QueuedOperation[] = [];
   private statusBarItem: HTMLElement | null = null;
+  private wsConnectionState: ConnectionState = 'disconnected';
 
   async onload() {
     console.log('ScionSyncPlugin: onload() starting...');
@@ -47,7 +54,7 @@ export default class ScionSyncPlugin extends Plugin {
 
     console.log('ScionSyncPlugin: Status bar item added');
 
-    // Initialize sync service with vault name
+    // Initialize sync service with vault name, device ID, and offline queue handlers
     this.syncService = new SyncService(
       this.app,
       this.settings,
@@ -55,7 +62,32 @@ export default class ScionSyncPlugin extends Plugin {
       this.syncState,
       async (data) => {
         this.syncState = (data as { syncState: typeof this.syncState }).syncState;
-        await this.saveData({ settings: this.settings, syncState: this.syncState });
+        await this.saveData({
+          settings: this.settings,
+          syncState: this.syncState,
+          deviceId: this.deviceId,
+          offlineQueue: this.offlineQueue,
+        });
+      },
+      () => this.deviceId,
+      async (id: string) => {
+        this.deviceId = id;
+        await this.saveData({
+          settings: this.settings,
+          syncState: this.syncState,
+          deviceId: this.deviceId,
+          offlineQueue: this.offlineQueue,
+        });
+      },
+      () => this.offlineQueue,
+      async (queue: QueuedOperation[]) => {
+        this.offlineQueue = queue;
+        await this.saveData({
+          settings: this.settings,
+          syncState: this.syncState,
+          deviceId: this.deviceId,
+          offlineQueue: this.offlineQueue,
+        });
       }
     );
 
@@ -69,6 +101,12 @@ export default class ScionSyncPlugin extends Plugin {
       if (this.settings.conflictMode === 'ask') {
         new ConflictModal(this.app, this, conflict).open();
       }
+    });
+
+    // Register connection state callback
+    this.syncService.setConnectionStateCallback((state) => {
+      this.wsConnectionState = state;
+      this.updateConnectionStatusBar(state);
     });
 
     console.log('ScionSyncPlugin: Callbacks registered');
@@ -147,11 +185,16 @@ export default class ScionSyncPlugin extends Plugin {
     const data = (await this.loadData()) as ScionSyncData | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data?.settings);
     this.syncState = data?.syncState || {};
+    this.deviceId = data?.deviceId || '';
+    this.offlineQueue = data?.offlineQueue || [];
     console.log('ScionSyncPlugin: Settings loaded', {
       serverUrl: this.settings.serverUrl,
       pollInterval: this.settings.pollInterval,
       autoSync: this.settings.autoSync,
+      useWebSocket: this.settings.useWebSocket,
+      deviceId: this.deviceId || '(new)',
       syncStateEntries: Object.keys(this.syncState).length,
+      offlineQueueSize: this.offlineQueue.length,
     });
   }
 
@@ -160,8 +203,14 @@ export default class ScionSyncPlugin extends Plugin {
       serverUrl: this.settings.serverUrl,
       pollInterval: this.settings.pollInterval,
       autoSync: this.settings.autoSync,
+      useWebSocket: this.settings.useWebSocket,
     });
-    await this.saveData({ settings: this.settings, syncState: this.syncState });
+    await this.saveData({
+      settings: this.settings,
+      syncState: this.syncState,
+      deviceId: this.deviceId,
+      offlineQueue: this.offlineQueue,
+    });
     console.log('ScionSyncPlugin: Settings saved');
   }
 
@@ -183,17 +232,17 @@ export default class ScionSyncPlugin extends Plugin {
     // Update content and class based on status
     switch (status) {
       case 'idle':
-        this.statusBarItem.setText('Scion: Synced');
+        this.statusBarItem.setText(this.getStatusText('Synced'));
         console.log('ScionSyncPlugin: Status bar set to idle');
         break;
       case 'syncing':
         this.statusBarItem.addClass('syncing');
-        this.statusBarItem.setText('Scion: Syncing...');
+        this.statusBarItem.setText(this.getStatusText('Syncing...'));
         console.log('ScionSyncPlugin: Status bar set to syncing');
         break;
       case 'success':
         this.statusBarItem.addClass('success');
-        this.statusBarItem.setText('Scion: Synced');
+        this.statusBarItem.setText(this.getStatusText('Synced'));
         console.log('ScionSyncPlugin: Status bar set to success (will reset in 3s)');
         // Fade back to idle after 3 seconds
         setTimeout(() => {
@@ -203,11 +252,33 @@ export default class ScionSyncPlugin extends Plugin {
         break;
       case 'error':
         this.statusBarItem.addClass('error');
-        this.statusBarItem.setText(`Scion: Error`);
+        this.statusBarItem.setText(this.getStatusText('Error'));
         this.statusBarItem.setAttr('title', message || 'Unknown error');
         console.log('ScionSyncPlugin: Status bar set to error', { message });
         break;
     }
+  }
+
+  private updateConnectionStatusBar(state: ConnectionState): void {
+    if (!this.statusBarItem) return;
+
+    // Update status text to reflect WebSocket state
+    const currentText = this.statusBarItem.getText();
+    if (currentText.includes('Syncing')) {
+      // Don't update during sync
+      return;
+    }
+
+    this.statusBarItem.setText(this.getStatusText(currentText.replace('Scion: ', '').replace(/[^a-zA-Z]/g, '') || 'Ready'));
+  }
+
+  private getStatusText(status: string): string {
+    if (this.settings.useWebSocket) {
+      const wsIcon = this.wsConnectionState === 'connected' ? '●' :
+                     this.wsConnectionState === 'connecting' || this.wsConnectionState === 'reconnecting' ? '○' : '○';
+      return `Scion ${wsIcon}: ${status}`;
+    }
+    return `Scion: ${status}`;
   }
 }
 
@@ -294,6 +365,19 @@ class ScionSyncSettingTab extends PluginSettingTab {
         })
       );
 
+    // Real-time sync toggle
+    new Setting(containerEl)
+      .setName('Real-time sync (WebSocket)')
+      .setDesc('Enable instant sync via WebSocket connection. Falls back to polling if unavailable.')
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.useWebSocket).onChange(async (value) => {
+          console.log(`ScionSyncSettingTab: WebSocket changed to: ${value}`);
+          this.plugin.settings.useWebSocket = value;
+          await this.plugin.saveSettings();
+          this.plugin.getSyncService()?.updateSettings(this.plugin.settings);
+        })
+      );
+
     // Sync on startup toggle
     new Setting(containerEl)
       .setName('Sync on startup')
@@ -374,8 +458,20 @@ class SyncStatusModal extends Modal {
     const infoEl = contentEl.createDiv({ cls: 'scion-status-info' });
     infoEl.createEl('p', { text: `Server: ${this.plugin.settings.serverUrl}` });
     infoEl.createEl('p', { text: `Vault: ${this.app.vault.getName()}` });
+    infoEl.createEl('p', { text: `Device ID: ${this.plugin.getSyncService()?.getDeviceId().substring(0, 16) || 'N/A'}...` });
     infoEl.createEl('p', { text: `Auto-sync: ${this.plugin.settings.autoSync ? 'Enabled' : 'Disabled'}` });
-    infoEl.createEl('p', { text: `Poll interval: ${this.plugin.settings.pollInterval}s` });
+    infoEl.createEl('p', { text: `Real-time: ${this.plugin.settings.useWebSocket ? 'Enabled' : 'Disabled'}` });
+
+    // WebSocket status
+    if (this.plugin.settings.useWebSocket) {
+      const wsState = this.plugin.getSyncService()?.getWebSocketState() || 'disconnected';
+      const wsStatus = wsState === 'connected' ? 'Connected' :
+                       wsState === 'connecting' ? 'Connecting...' :
+                       wsState === 'reconnecting' ? 'Reconnecting...' : 'Disconnected';
+      infoEl.createEl('p', { text: `WebSocket: ${wsStatus}` });
+    } else {
+      infoEl.createEl('p', { text: `Poll interval: ${this.plugin.settings.pollInterval}s` });
+    }
 
     contentEl.createEl('hr');
 

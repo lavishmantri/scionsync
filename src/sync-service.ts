@@ -1,4 +1,8 @@
-import { App, Notice, TFile, Vault, EventRef } from 'obsidian';
+import { App, Notice, TFile, TFolder, Vault, EventRef } from 'obsidian';
+import { WebSocketClient, generateDeviceId, type WebSocketMessage, type ConnectionState } from './websocket-client';
+import { YjsManager, shouldUseYjs, uint8ArrayToBase64, base64ToUint8Array } from './yjs-manager';
+import { StructureCRDT, structureUint8ArrayToBase64, structureBase64ToUint8Array, type FileEntry } from './structure-crdt';
+import { OfflineQueue, type QueuedOperation } from './offline-queue';
 
 interface FileRecord {
   path: string;
@@ -60,7 +64,10 @@ export interface ScionSyncSettings {
   syncOnStartup: boolean;
   conflictMode: 'merge' | 'ask' | 'local' | 'remote';
   debounceInterval: number; // seconds to pause sync after typing
+  useWebSocket: boolean; // Enable real-time WebSocket sync
 }
+
+export type { ConnectionState };
 
 export type SyncStatus = 'idle' | 'syncing' | 'success' | 'error';
 
@@ -92,6 +99,7 @@ export class SyncService {
   private saveDataFn: (data: unknown) => Promise<void>;
   private statusCallback: ((status: SyncStatus, message?: string) => void) | null = null;
   private conflictCallback: ((conflict: PendingConflict) => void) | null = null;
+  private connectionStateCallback: ((state: ConnectionState) => void) | null = null;
   private isSyncing = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastHeadCommit: string | null = null;
@@ -101,6 +109,23 @@ export class SyncService {
   private pendingRenames: Map<string, string> = new Map(); // old_path -> new_path
   private pendingOperations: SyncOperation[] = [];
 
+  // WebSocket support
+  private wsClient: WebSocketClient | null = null;
+  private deviceId: string;
+  private getDeviceIdFn: () => string;
+  private setDeviceIdFn: (id: string) => Promise<void>;
+
+  // Yjs support for real-time CRDT sync
+  private yjsManager: YjsManager;
+
+  // Structure CRDT for file operations
+  private structureCrdt: StructureCRDT;
+
+  // Offline queue for operations when disconnected
+  private offlineQueue: OfflineQueue;
+  private getQueueFn: () => QueuedOperation[];
+  private setQueueFn: (queue: QueuedOperation[]) => Promise<void>;
+
   private static readonly DEBOUNCE_MS = 2000;
 
   constructor(
@@ -108,7 +133,11 @@ export class SyncService {
     settings: ScionSyncSettings,
     vaultName: string,
     syncState: SyncState,
-    saveDataFn: (data: unknown) => Promise<void>
+    saveDataFn: (data: unknown) => Promise<void>,
+    getDeviceIdFn: () => string,
+    setDeviceIdFn: (id: string) => Promise<void>,
+    getQueueFn: () => QueuedOperation[],
+    setQueueFn: (queue: QueuedOperation[]) => Promise<void>
   ) {
     this.app = app;
     this.vault = app.vault;
@@ -116,10 +145,31 @@ export class SyncService {
     this.vaultName = vaultName;
     this.syncState = syncState || {};
     this.saveDataFn = saveDataFn;
+    this.getDeviceIdFn = getDeviceIdFn;
+    this.setDeviceIdFn = setDeviceIdFn;
+    this.getQueueFn = getQueueFn;
+    this.setQueueFn = setQueueFn;
+
+    // Initialize or generate device ID
+    this.deviceId = getDeviceIdFn() || generateDeviceId();
+
+    // Initialize Yjs manager for CRDT sync
+    this.yjsManager = new YjsManager();
+
+    // Initialize Structure CRDT
+    this.structureCrdt = new StructureCRDT();
+
+    // Initialize Offline Queue
+    this.offlineQueue = new OfflineQueue(setQueueFn);
+    this.offlineQueue.load(getQueueFn());
+    this.offlineQueue.setProcessor((op) => this.processQueuedOperation(op));
+
     console.log('SyncService: Constructor called', {
       serverUrl: settings.serverUrl,
       vaultName: this.vaultName,
       pollInterval: settings.pollInterval,
+      useWebSocket: settings.useWebSocket,
+      deviceId: this.deviceId,
       existingSyncStateCount: Object.keys(this.syncState).length,
     });
   }
@@ -141,6 +191,11 @@ export class SyncService {
     console.log('SyncService: Conflict callback registered');
   }
 
+  setConnectionStateCallback(callback: (state: ConnectionState) => void): void {
+    this.connectionStateCallback = callback;
+    console.log('SyncService: Connection state callback registered');
+  }
+
   private updateStatus(status: SyncStatus, message?: string): void {
     console.log(`SyncService: Status changed to '${status}'`, message ? { message } : '');
     this.statusCallback?.(status, message);
@@ -150,11 +205,23 @@ export class SyncService {
     console.log('SyncService: Initializing...');
 
     try {
+      // Save device ID if it was generated
+      if (!this.getDeviceIdFn()) {
+        await this.setDeviceIdFn(this.deviceId);
+        console.log('SyncService: Saved new device ID:', this.deviceId);
+      }
+
+      // Initialize WebSocket if enabled
+      if (this.settings.useWebSocket) {
+        await this.initializeWebSocket();
+      }
+
       if (this.settings.syncOnStartup) {
         await this.syncAll();
       }
       this.setupFileWatcher();
 
+      // Start polling as fallback (will skip if WebSocket is connected)
       if (this.settings.autoSync) {
         this.startPolling();
       }
@@ -164,6 +231,428 @@ export class SyncService {
       console.error('SyncService: Initialization failed', error);
       new Notice('Scion Sync: Failed to connect to server');
     }
+  }
+
+  /**
+   * Initialize WebSocket connection
+   */
+  private async initializeWebSocket(): Promise<void> {
+    if (this.wsClient) {
+      this.wsClient.destroy();
+    }
+
+    console.log('SyncService: Initializing WebSocket...');
+    this.wsClient = new WebSocketClient(this.settings.serverUrl, this.vaultName, this.deviceId);
+
+    // Register connection state handler
+    this.wsClient.onConnectionStateChange(async (state) => {
+      console.log(`SyncService: WebSocket state changed to: ${state}`);
+      this.connectionStateCallback?.(state);
+
+      if (state === 'connected') {
+        // Stop polling when WebSocket is connected
+        console.log('SyncService: WebSocket connected, reducing poll frequency');
+
+        // Flush offline queue when reconnecting
+        const queueStatus = this.offlineQueue.getStatus();
+        if (queueStatus.count > 0) {
+          console.log(`SyncService: Flushing ${queueStatus.count} queued operations`);
+          const result = await this.offlineQueue.processQueue();
+          if (result.processed > 0) {
+            new Notice(`Scion Sync: Synced ${result.processed} offline changes`);
+          }
+          if (result.failed > 0) {
+            new Notice(`Scion Sync: ${result.failed} offline changes failed to sync`);
+          }
+        }
+      } else if (state === 'disconnected' || state === 'reconnecting') {
+        // Resume normal polling when WebSocket is disconnected
+        console.log('SyncService: WebSocket disconnected, using HTTP polling');
+      }
+    });
+
+    // Register message handlers
+    this.wsClient.onMessage('yjs-update', (msg) => this.handleYjsUpdate(msg));
+    this.wsClient.onMessage('structure-update', (msg) => this.handleStructureUpdate(msg));
+    this.wsClient.onMessage('binary-update', (msg) => this.handleBinaryUpdate(msg));
+
+    // Set up structure CRDT to send updates via WebSocket
+    this.structureCrdt.onUpdate((update) => {
+      if (this.wsClient && this.wsClient.isConnected()) {
+        this.wsClient.send({
+          type: 'structure-update',
+          payload: structureUint8ArrayToBase64(update),
+        });
+        console.log(`SyncService: Sent structure update (${update.length} bytes)`);
+      }
+    });
+
+    try {
+      await this.wsClient.connect();
+      console.log('SyncService: WebSocket connected');
+    } catch (error) {
+      console.warn('SyncService: WebSocket connection failed, falling back to polling:', error);
+      // WebSocket will auto-reconnect, polling will serve as backup
+    }
+  }
+
+  /**
+   * Handle incoming Yjs update from WebSocket
+   * Applies the CRDT update and writes merged content to the file
+   */
+  private async handleYjsUpdate(message: WebSocketMessage): Promise<void> {
+    if (!message.fileId || !message.payload) {
+      console.warn('SyncService: Invalid Yjs update - missing fileId or payload');
+      return;
+    }
+
+    console.log('SyncService: Received Yjs update for file:', message.fileId);
+
+    // Find the file path by file_id in sync state
+    let filePath: string | null = null;
+    for (const [path, state] of Object.entries(this.syncState)) {
+      if (state.file_id === message.fileId) {
+        filePath = path;
+        break;
+      }
+    }
+
+    if (!filePath) {
+      console.warn(`SyncService: Unknown file_id ${message.fileId}, cannot apply Yjs update`);
+      return;
+    }
+
+    // Check if this file should use Yjs (text files only)
+    if (!shouldUseYjs(filePath)) {
+      console.log(`SyncService: File ${filePath} is not a text file, skipping Yjs update`);
+      return;
+    }
+
+    try {
+      // Decode the base64 payload to Uint8Array
+      const update = base64ToUint8Array(message.payload);
+
+      // Apply the remote update via YjsManager
+      const mergedContent = this.yjsManager.applyRemoteUpdate(message.fileId, update);
+
+      // Write the merged content to the local file
+      const file = this.vault.getAbstractFileByPath(filePath);
+      if (file instanceof TFile) {
+        // Only modify if content actually changed
+        const currentContent = await this.vault.read(file);
+        if (currentContent !== mergedContent) {
+          console.log(`SyncService: Applying Yjs merge to ${filePath}`);
+          await this.vault.modify(file, mergedContent);
+        }
+      } else {
+        console.warn(`SyncService: File ${filePath} not found locally for Yjs update`);
+      }
+    } catch (error) {
+      console.error(`SyncService: Failed to apply Yjs update for ${filePath}:`, error);
+    }
+  }
+
+  /**
+   * Handle incoming structure update from WebSocket
+   * Applies the CRDT update and syncs filesystem to match
+   */
+  private async handleStructureUpdate(message: WebSocketMessage): Promise<void> {
+    if (!message.payload) {
+      console.warn('SyncService: Invalid structure update - missing payload');
+      return;
+    }
+
+    console.log('SyncService: Received structure update');
+
+    try {
+      // Decode and apply the update
+      const update = structureBase64ToUint8Array(message.payload);
+      this.structureCrdt.applyRemoteUpdate(update);
+
+      // Sync filesystem to match CRDT state
+      await this.syncFilesystemToStructure();
+    } catch (error) {
+      console.error('SyncService: Failed to apply structure update:', error);
+    }
+  }
+
+  /**
+   * Sync local filesystem to match structure CRDT state
+   */
+  private async syncFilesystemToStructure(): Promise<void> {
+    const localFiles = this.vault.getFiles();
+    const localPaths = new Set(localFiles.map((f) => f.path));
+
+    // Get files that need to be created locally
+    const filesToCreate = this.structureCrdt.getFilesToCreate(localPaths);
+    for (const entry of filesToCreate) {
+      console.log(`SyncService: Structure CRDT says to download: ${entry.path}`);
+      try {
+        await this.downloadFile(entry.path);
+      } catch (error) {
+        console.error(`SyncService: Failed to download ${entry.path}:`, error);
+      }
+    }
+
+    // Get files that need to be deleted locally
+    const filesToDelete = this.structureCrdt.getFilesToDelete(localPaths);
+    for (const entry of filesToDelete) {
+      console.log(`SyncService: Structure CRDT says to delete: ${entry.path}`);
+      const file = this.vault.getAbstractFileByPath(entry.path);
+      if (file instanceof TFile) {
+        try {
+          await this.vault.delete(file);
+        } catch (error) {
+          console.error(`SyncService: Failed to delete ${entry.path}:`, error);
+        }
+      }
+    }
+
+    // Handle renames - build map of local path -> file_id
+    const localPathToFileId = new Map<string, string>();
+    for (const [path, state] of Object.entries(this.syncState)) {
+      if (state.file_id && localPaths.has(path)) {
+        localPathToFileId.set(path, state.file_id);
+      }
+    }
+
+    const filesToRename = this.structureCrdt.getFilesToRename(localPathToFileId);
+    for (const { entry, localPath } of filesToRename) {
+      console.log(`SyncService: Structure CRDT says to rename: ${localPath} -> ${entry.path}`);
+      const file = this.vault.getAbstractFileByPath(localPath);
+      if (file instanceof TFile) {
+        try {
+          await this.vault.rename(file, entry.path);
+          // Update sync state
+          this.syncState[entry.path] = { ...this.syncState[localPath], file_id: entry.file_id };
+          delete this.syncState[localPath];
+        } catch (error) {
+          console.error(`SyncService: Failed to rename ${localPath} -> ${entry.path}:`, error);
+        }
+      }
+    }
+
+    await this.saveSyncState();
+  }
+
+  /**
+   * Handle incoming binary update from WebSocket
+   * Downloads the binary file or shows conflict notice
+   */
+  private async handleBinaryUpdate(message: WebSocketMessage): Promise<void> {
+    if (!message.fileId) {
+      console.warn('SyncService: Invalid binary update - missing fileId');
+      return;
+    }
+
+    console.log('SyncService: Received binary update for file:', message.fileId);
+
+    // Check if this is a deletion
+    if (message.payload === 'deleted') {
+      console.log(`SyncService: Binary file deleted on server: ${message.fileId}`);
+      const file = this.vault.getAbstractFileByPath(message.fileId);
+      if (file instanceof TFile) {
+        try {
+          await this.vault.delete(file);
+          delete this.syncState[message.fileId];
+          await this.saveSyncState();
+        } catch (error) {
+          console.error(`SyncService: Failed to delete binary file: ${message.fileId}`, error);
+        }
+      }
+      return;
+    }
+
+    // Check if this is a conflict notification
+    if (message.payload && message.payload.startsWith('conflict:')) {
+      const conflictPath = message.payload.substring(9); // Remove 'conflict:' prefix
+      new Notice(`Binary conflict: ${message.fileId}\nConflict copy saved as: ${conflictPath}`);
+      console.log(`SyncService: Binary conflict for ${message.fileId}, conflict copy: ${conflictPath}`);
+
+      // Download the conflict copy
+      try {
+        await this.downloadFile(conflictPath);
+      } catch (error) {
+        console.error(`SyncService: Failed to download conflict copy: ${conflictPath}`, error);
+      }
+      return;
+    }
+
+    // Regular binary update - download the file
+    // For binary files, fileId is the path
+    const filePath = message.fileId;
+
+    // Also check sync state for file_id mapping
+    let targetPath = filePath;
+    for (const [path, state] of Object.entries(this.syncState)) {
+      if (state.file_id === message.fileId) {
+        targetPath = path;
+        break;
+      }
+    }
+
+    console.log(`SyncService: Downloading updated binary file: ${targetPath}`);
+    try {
+      await this.downloadFile(targetPath);
+    } catch (error) {
+      console.error(`SyncService: Failed to download binary file: ${targetPath}`, error);
+    }
+  }
+
+  /**
+   * Send a local file change as a Yjs update via WebSocket
+   * Returns true if sent successfully, false if should fall back to HTTP
+   */
+  private async sendYjsUpdate(path: string): Promise<boolean> {
+    const localState = this.syncState[path];
+    const fileId = localState?.file_id;
+
+    // Can't use Yjs without a file_id
+    if (!fileId) {
+      console.log(`SyncService: No file_id for ${path}, cannot send Yjs update`);
+      return false;
+    }
+
+    // Check if WebSocket is connected - if not, queue for later
+    if (!this.isWebSocketConnected()) {
+      console.log(`SyncService: WebSocket not connected, queueing Yjs update for ${path}`);
+
+      // Still generate the update for queuing
+      try {
+        const file = this.vault.getAbstractFileByPath(path);
+        if (file instanceof TFile) {
+          const content = await this.vault.read(file);
+          const update = this.yjsManager.applyLocalChange(fileId, content);
+          if (update) {
+            this.queueOfflineOperation('yjs-update', fileId, path, uint8ArrayToBase64(update));
+          }
+        }
+      } catch (error) {
+        console.error(`SyncService: Error queueing Yjs update for ${path}:`, error);
+      }
+
+      return false;
+    }
+
+    // Check if this is a text file
+    if (!shouldUseYjs(path)) {
+      console.log(`SyncService: ${path} is not a text file, skipping Yjs`);
+      return false;
+    }
+
+    try {
+      // Read current file content
+      const file = this.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) {
+        console.warn(`SyncService: File not found for Yjs update: ${path}`);
+        return false;
+      }
+
+      const content = await this.vault.read(file);
+
+      // Apply the local change and get the Yjs update
+      const update = this.yjsManager.applyLocalChange(fileId, content);
+
+      if (!update) {
+        // No change detected
+        console.log(`SyncService: No Yjs update needed for ${path} (content unchanged)`);
+        return true;
+      }
+
+      // Send the update via WebSocket
+      const sent = this.wsClient!.send({
+        type: 'yjs-update',
+        fileId,
+        payload: uint8ArrayToBase64(update),
+      });
+
+      if (sent) {
+        console.log(`SyncService: Sent Yjs update for ${path} (${update.length} bytes)`);
+        this.yjsManager.markSynced(fileId);
+        return true;
+      } else {
+        console.warn(`SyncService: Failed to send Yjs update for ${path}`);
+        return false;
+      }
+    } catch (error) {
+      console.error(`SyncService: Error sending Yjs update for ${path}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Process a queued operation (called by OfflineQueue when coming back online)
+   */
+  private async processQueuedOperation(operation: QueuedOperation): Promise<boolean> {
+    if (!this.isWebSocketConnected()) {
+      console.log(`SyncService: Cannot process queue, WebSocket not connected`);
+      return false;
+    }
+
+    try {
+      const sent = this.wsClient!.send({
+        type: operation.type,
+        fileId: operation.fileId,
+        payload: operation.payload,
+      });
+
+      if (sent) {
+        console.log(`SyncService: Processed queued ${operation.type} for ${operation.path}`);
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error(`SyncService: Error processing queued operation:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Queue an operation for later sync (when offline)
+   */
+  private queueOfflineOperation(
+    type: 'yjs-update' | 'structure-update' | 'binary-sync',
+    fileId: string,
+    path: string,
+    payload: string
+  ): void {
+    this.offlineQueue.enqueue({
+      type,
+      fileId,
+      path,
+      payload,
+    });
+    console.log(`SyncService: Queued ${type} for ${path} (offline)`);
+  }
+
+  /**
+   * Get offline queue status
+   */
+  getOfflineQueueStatus(): { count: number; oldestTimestamp: number | null } {
+    const status = this.offlineQueue.getStatus();
+    return { count: status.count, oldestTimestamp: status.oldestTimestamp };
+  }
+
+  /**
+   * Check if WebSocket is connected
+   */
+  isWebSocketConnected(): boolean {
+    return this.wsClient?.isConnected() ?? false;
+  }
+
+  /**
+   * Get WebSocket connection state
+   */
+  getWebSocketState(): ConnectionState {
+    return this.wsClient?.getConnectionState() ?? 'disconnected';
+  }
+
+  /**
+   * Get device ID
+   */
+  getDeviceId(): string {
+    return this.deviceId;
   }
 
   /**
@@ -198,6 +687,11 @@ export class SyncService {
    * Check server for changes (polling)
    */
   async checkForChanges(): Promise<void> {
+    // Skip polling if WebSocket is connected (real-time sync is active)
+    if (this.isWebSocketConnected()) {
+      return;
+    }
+
     // Skip polling if user is actively typing
     if (this.isUserActive) {
       console.log('SyncService: Skipping poll - user is active');
@@ -239,8 +733,26 @@ export class SyncService {
   updateSettings(settings: ScionSyncSettings): void {
     const pollIntervalChanged = this.settings.pollInterval !== settings.pollInterval;
     const autoSyncChanged = this.settings.autoSync !== settings.autoSync;
+    const serverUrlChanged = this.settings.serverUrl !== settings.serverUrl;
+    const webSocketChanged = this.settings.useWebSocket !== settings.useWebSocket;
 
     this.settings = settings;
+
+    // Handle WebSocket changes
+    if (webSocketChanged || serverUrlChanged) {
+      if (settings.useWebSocket) {
+        // Reconnect WebSocket with new settings
+        this.initializeWebSocket();
+      } else if (this.wsClient) {
+        // Disable WebSocket
+        this.wsClient.destroy();
+        this.wsClient = null;
+        console.log('SyncService: WebSocket disabled');
+      }
+    } else if (serverUrlChanged && this.wsClient) {
+      // Update WebSocket server URL
+      this.wsClient.updateServerUrl(settings.serverUrl);
+    }
 
     if (autoSyncChanged) {
       if (settings.autoSync) {
@@ -784,12 +1296,23 @@ export class SyncService {
       console.log(`SyncService: Debounce started for: ${path} (${SyncService.DEBOUNCE_MS}ms)`);
     }
 
-    // Set new timer - queue V2 operation
+    // Set new timer - try Yjs first for text files, fall back to V2 HTTP
     const timer = setTimeout(async () => {
       console.log(`SyncService: Debounce timer fired for: ${path}`);
       this.debounceTimers.delete(path);
       try {
-        // Queue as V2 operation
+        // Try Yjs/WebSocket first for text files
+        if (this.settings.useWebSocket && shouldUseYjs(path)) {
+          const sent = await this.sendYjsUpdate(path);
+          if (sent) {
+            console.log(`SyncService: Successfully sent ${path} via Yjs/WebSocket`);
+            return;
+          }
+          // Fall through to HTTP if Yjs failed
+          console.log(`SyncService: Yjs failed for ${path}, falling back to HTTP`);
+        }
+
+        // Queue as V2 HTTP operation
         await this.queueFileForUpload(path);
         this.debouncedBatchSync();
       } catch (error) {
@@ -1183,6 +1706,25 @@ export class SyncService {
 
     // Stop polling
     this.stopPolling();
+
+    // Disconnect WebSocket
+    if (this.wsClient) {
+      this.wsClient.destroy();
+      this.wsClient = null;
+      console.log('SyncService: WebSocket client destroyed');
+    }
+
+    // Clean up Yjs manager
+    if (this.yjsManager) {
+      this.yjsManager.destroy();
+      console.log('SyncService: YjsManager destroyed');
+    }
+
+    // Clean up structure CRDT
+    if (this.structureCrdt) {
+      this.structureCrdt.destroy();
+      console.log('SyncService: StructureCRDT destroyed');
+    }
 
     // Clear activity timer
     if (this.activityTimer) {

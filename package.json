@@ -7,7 +7,10 @@
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production"
   },
-  "keywords": ["obsidian", "sync"],
+  "keywords": [
+    "obsidian",
+    "sync"
+  ],
   "author": "Lavish Mantri",
   "license": "MIT",
   "devDependencies": {
@@ -16,5 +19,8 @@
     "esbuild": "^0.27.2",
     "obsidian": "^1.11.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "yjs": "^13.6.28"
   }
 }
