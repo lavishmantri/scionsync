@@ -44,6 +44,10 @@ var _SyncService = class _SyncService {
     this.pendingConflicts = [];
     this.isUserActive = false;
     this.activityTimer = null;
+    this.pendingRenames = /* @__PURE__ */ new Map();
+    // old_path -> new_path
+    this.pendingOperations = [];
+    this.batchSyncTimer = null;
     this.app = app;
     this.vault = app.vault;
     this.settings = settings;
@@ -168,7 +172,7 @@ var _SyncService = class _SyncService {
       console.log("SyncService: Sync already in progress, skipping");
       return;
     }
-    console.log("SyncService: Starting full sync...");
+    console.log("SyncService: Starting full sync (V2)...");
     this.isSyncing = true;
     this.updateStatus("syncing");
     try {
@@ -177,12 +181,16 @@ var _SyncService = class _SyncService {
       const serverFiles = new Map(manifest.files.map((f) => [f.path, f]));
       this.lastHeadCommit = manifest.head_commit;
       console.log(`SyncService: Server has ${serverFiles.size} files, head: ${manifest.head_commit}`);
+      for (const [serverPath, serverRecord] of serverFiles) {
+        if (this.syncState[serverPath] && serverRecord.file_id) {
+          this.syncState[serverPath].file_id = serverRecord.file_id;
+        }
+      }
       const localFiles = this.vault.getFiles();
       const localPaths = new Set(localFiles.map((f) => f.path));
       console.log(`SyncService: Local vault has ${localFiles.length} files`);
       const downloadsNeeded = [];
-      const uploadsNeeded = [];
-      const deletionsNeeded = [];
+      const operations = [];
       const hashCache = /* @__PURE__ */ new Map();
       for (const [serverPath, serverRecord] of serverFiles) {
         const localState = this.syncState[serverPath];
@@ -191,8 +199,15 @@ var _SyncService = class _SyncService {
             console.log(`SyncService: Scheduling download of new file: ${serverPath}`);
             downloadsNeeded.push(serverPath);
           } else {
-            console.log(`SyncService: File ${serverPath} was deleted locally, will be deleted from server`);
-            deletionsNeeded.push(serverPath);
+            console.log(`SyncService: File ${serverPath} was deleted locally, scheduling V2 delete`);
+            const fileId = localState.file_id || serverRecord.file_id;
+            if (fileId) {
+              operations.push({
+                type: "delete",
+                path: serverPath,
+                file_id: fileId
+              });
+            }
           }
         } else if (localState && serverRecord.commit !== localState.commit) {
           console.log(`SyncService: Server has different version: ${serverPath}`);
@@ -202,8 +217,19 @@ var _SyncService = class _SyncService {
             hashCache.set(serverPath, currentHash);
           }
           if (currentHash !== localState.hash) {
-            console.log(`SyncService: Local changes exist, scheduling upload for merge: ${serverPath}`);
-            uploadsNeeded.push(serverPath);
+            console.log(`SyncService: Local changes exist, scheduling V2 modify for merge: ${serverPath}`);
+            const file = this.vault.getAbstractFileByPath(serverPath);
+            if (file instanceof import_obsidian.TFile) {
+              const content = await this.vault.readBinary(file);
+              const fileId = localState.file_id || serverRecord.file_id;
+              operations.push({
+                type: "modify",
+                path: serverPath,
+                file_id: fileId,
+                content: this.arrayBufferToBase64(content),
+                base_commit: localState.commit
+              });
+            }
           } else {
             console.log(`SyncService: Scheduling download of updated file: ${serverPath}`);
             downloadsNeeded.push(serverPath);
@@ -214,8 +240,13 @@ var _SyncService = class _SyncService {
         const serverRecord = serverFiles.get(file.path);
         const localState = this.syncState[file.path];
         if (!serverRecord) {
-          console.log(`SyncService: Scheduling upload of new file: ${file.path}`);
-          uploadsNeeded.push(file.path);
+          console.log(`SyncService: Scheduling V2 create of new file: ${file.path}`);
+          const content = await this.vault.readBinary(file);
+          operations.push({
+            type: "create",
+            path: file.path,
+            content: this.arrayBufferToBase64(content)
+          });
         } else if (localState) {
           let currentHash = hashCache.get(file.path);
           if (!currentHash) {
@@ -223,31 +254,52 @@ var _SyncService = class _SyncService {
             hashCache.set(file.path, currentHash);
           }
           if (currentHash !== localState.hash) {
-            console.log(`SyncService: Scheduling upload of modified file: ${file.path}`);
-            uploadsNeeded.push(file.path);
+            const alreadyScheduled = operations.some((op) => op.path === file.path);
+            if (!alreadyScheduled) {
+              console.log(`SyncService: Scheduling V2 modify of changed file: ${file.path}`);
+              const content = await this.vault.readBinary(file);
+              const fileId = localState.file_id || serverRecord.file_id;
+              operations.push({
+                type: "modify",
+                path: file.path,
+                file_id: fileId,
+                content: this.arrayBufferToBase64(content),
+                base_commit: localState.commit
+              });
+            }
           }
         }
       }
       for (const syncedPath of Object.keys(this.syncState)) {
-        if (!localPaths.has(syncedPath)) {
-          console.log(`SyncService: Scheduling deletion from server: ${syncedPath}`);
-          deletionsNeeded.push(syncedPath);
+        if (!localPaths.has(syncedPath) && !serverFiles.has(syncedPath)) {
+          delete this.syncState[syncedPath];
+        } else if (!localPaths.has(syncedPath) && serverFiles.has(syncedPath)) {
+          const alreadyScheduled = operations.some((op) => op.path === syncedPath && op.type === "delete");
+          if (!alreadyScheduled) {
+            const localState = this.syncState[syncedPath];
+            const serverRecord = serverFiles.get(syncedPath);
+            const fileId = (localState == null ? void 0 : localState.file_id) || (serverRecord == null ? void 0 : serverRecord.file_id);
+            if (fileId) {
+              console.log(`SyncService: Scheduling V2 delete from server: ${syncedPath}`);
+              operations.push({
+                type: "delete",
+                path: syncedPath,
+                file_id: fileId
+              });
+            }
+          }
         }
       }
-      console.log(`SyncService: Executing ${downloadsNeeded.length} downloads, ${uploadsNeeded.length} uploads, ${deletionsNeeded.length} deletions`);
-      await Promise.all([
-        ...downloadsNeeded.map((path) => this.downloadFile(path)),
-        ...uploadsNeeded.map((path) => this.uploadFile(path)),
-        ...deletionsNeeded.map((path) => this.deleteFromServer(path))
-      ]);
-      for (const deletedPath of deletionsNeeded) {
-        delete this.syncState[deletedPath];
+      if (downloadsNeeded.length > 0) {
+        console.log(`SyncService: Executing ${downloadsNeeded.length} downloads`);
+        await Promise.all(downloadsNeeded.map((path) => this.downloadFile(path)));
       }
-      if (deletionsNeeded.length > 0) {
-        await this.saveSyncState();
+      if (operations.length > 0) {
+        console.log(`SyncService: Executing V2 batch sync with ${operations.length} operations`);
+        await this.syncBatchV2(operations, false);
       }
       this.clearResolvedConflicts();
-      console.log("SyncService: Full sync completed successfully");
+      console.log("SyncService: Full sync (V2) completed successfully");
       this.updateStatus("success");
       new import_obsidian.Notice("Scion Sync: Sync complete");
     } catch (error) {
@@ -306,10 +358,11 @@ var _SyncService = class _SyncService {
       }
       this.syncState[path] = {
         hash: result.hash,
-        commit: result.commit
+        commit: result.commit,
+        file_id: result.file_id
       };
       await this.saveSyncState();
-      console.log(`SyncService: Uploaded ${path} (commit ${result.commit})`);
+      console.log(`SyncService: Uploaded ${path} (commit ${result.commit}, file_id: ${result.file_id})`);
     } catch (error) {
       console.error(`SyncService: Failed to upload ${path}`, error);
       throw error;
@@ -361,7 +414,7 @@ var _SyncService = class _SyncService {
         break;
       case "local":
         console.log(`SyncService: Keeping local version for ${path}`);
-        this.syncState[path] = { hash: result.hash, commit: result.commit };
+        this.syncState[path] = { hash: result.hash, commit: result.commit, file_id: result.file_id };
         await this.saveSyncState();
         await this.uploadFile(path);
         break;
@@ -375,7 +428,8 @@ var _SyncService = class _SyncService {
         await this.vault.modify(file, mergedContent);
         this.syncState[path] = {
           hash: result.hash,
-          commit: result.commit
+          commit: result.commit,
+          file_id: result.file_id
         };
         await this.saveSyncState();
         new import_obsidian.Notice(`Scion Sync: Conflict in "${path}" - resolve markers and save`);
@@ -438,7 +492,8 @@ var _SyncService = class _SyncService {
       const content = await response.arrayBuffer();
       const commit = response.headers.get("X-File-Commit") || "";
       const hash = response.headers.get("X-File-Hash") || "";
-      console.log(`SyncService: Downloaded ${path}, size: ${content.byteLength} bytes, commit: ${commit}`);
+      const fileId = response.headers.get("X-File-Id") || void 0;
+      console.log(`SyncService: Downloaded ${path}, size: ${content.byteLength} bytes, commit: ${commit}, file_id: ${fileId}`);
       const existingFile = this.vault.getAbstractFileByPath(path);
       if (existingFile instanceof import_obsidian.TFile) {
         console.log(`SyncService: Updating existing file: ${path}`);
@@ -452,7 +507,7 @@ var _SyncService = class _SyncService {
         console.log(`SyncService: Creating new file: ${path}`);
         await this.vault.createBinary(path, content);
       }
-      this.syncState[path] = { hash, commit };
+      this.syncState[path] = { hash, commit, file_id: fileId };
       await this.saveSyncState();
       console.log(`SyncService: Download complete for ${path} (commit ${commit})`);
     } catch (error) {
@@ -483,7 +538,14 @@ var _SyncService = class _SyncService {
       }
     });
     this.eventRefs.push(deleteRef);
-    console.log("SyncService: File watcher setup complete (modify, create, delete)");
+    const renameRef = this.vault.on("rename", (file, oldPath) => {
+      if (file instanceof import_obsidian.TFile) {
+        console.log(`SyncService: File renamed event: ${oldPath} -> ${file.path}`);
+        this.handleFileRename(oldPath, file.path);
+      }
+    });
+    this.eventRefs.push(renameRef);
+    console.log("SyncService: File watcher setup complete (modify, create, delete, rename)");
   }
   /**
    * Mark user as active (typing) - pauses polling until debounce interval passes
@@ -515,7 +577,8 @@ var _SyncService = class _SyncService {
       console.log(`SyncService: Debounce timer fired for: ${path}`);
       this.debounceTimers.delete(path);
       try {
-        await this.uploadFile(path);
+        await this.queueFileForUpload(path);
+        this.debouncedBatchSync();
       } catch (error) {
         console.error(`SyncService: Debounced upload failed for ${path}`, error);
       }
@@ -526,14 +589,251 @@ var _SyncService = class _SyncService {
     console.log(`SyncService: Handling file deletion: ${path}`);
     if (this.syncState[path]) {
       if (this.settings.autoSync) {
-        await this.deleteFromServer(path);
-        console.log(`SyncService: Deleted ${path} from server`);
-        delete this.syncState[path];
-        await this.saveSyncState();
+        const fileId = this.syncState[path].file_id;
+        if (fileId) {
+          this.queueOperation({
+            type: "delete",
+            path,
+            file_id: fileId
+          });
+          this.debouncedBatchSync();
+        } else {
+          await this.deleteFromServer(path);
+          console.log(`SyncService: Deleted ${path} from server (V1 fallback)`);
+          delete this.syncState[path];
+          await this.saveSyncState();
+        }
       } else {
         console.log(`SyncService: File ${path} deleted locally, marking for deletion on next manual sync`);
       }
     }
+  }
+  handleFileRename(oldPath, newPath) {
+    console.log(`SyncService: Handling file rename: ${oldPath} -> ${newPath}`);
+    this.pendingRenames.set(oldPath, newPath);
+    const oldState = this.syncState[oldPath];
+    if (oldState) {
+      if (this.settings.autoSync) {
+        const fileId = oldState.file_id;
+        if (fileId) {
+          this.queueOperation({
+            type: "rename",
+            path: newPath,
+            old_path: oldPath,
+            file_id: fileId
+          });
+          this.debouncedBatchSync();
+        } else {
+          console.log(`SyncService: No file_id for ${oldPath}, treating rename as delete+create`);
+          this.handleFileDelete(oldPath);
+          this.debouncedUpload(newPath);
+        }
+      }
+      this.syncState[newPath] = { ...oldState };
+      delete this.syncState[oldPath];
+      this.saveSyncState();
+    }
+  }
+  queueOperation(operation) {
+    this.pendingOperations = this.pendingOperations.filter(
+      (op) => op.path !== operation.path && op.old_path !== operation.path
+    );
+    this.pendingOperations.push(operation);
+    console.log(`SyncService: Queued ${operation.type} operation for ${operation.path}`);
+  }
+  debouncedBatchSync() {
+    if (this.batchSyncTimer) {
+      clearTimeout(this.batchSyncTimer);
+    }
+    this.batchSyncTimer = setTimeout(async () => {
+      this.batchSyncTimer = null;
+      if (this.pendingOperations.length > 0) {
+        await this.syncBatchV2();
+      }
+    }, _SyncService.DEBOUNCE_MS);
+  }
+  /**
+   * V2 Batch Sync - sends multiple operations in a single request
+   */
+  async syncBatchV2(operations, atomic = true) {
+    const ops = operations || this.pendingOperations;
+    if (ops.length === 0) {
+      console.log("SyncService: No operations to sync");
+      return null;
+    }
+    console.log(`SyncService: Starting V2 batch sync with ${ops.length} operations`);
+    this.updateStatus("syncing");
+    try {
+      const request = {
+        operations: ops,
+        atomic
+      };
+      const response = await fetch(`${this.getVaultBaseUrl()}/sync/v2`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request)
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("SyncService: V2 batch sync failed", { status: response.status, body: errorText });
+        throw new Error(`V2 sync failed: ${response.status} ${response.statusText}`);
+      }
+      const result = await response.json();
+      console.log("SyncService: V2 batch sync response", {
+        success: result.success,
+        resultsCount: result.results.length,
+        headCommit: result.head_commit
+      });
+      await this.processV2Results(ops, result);
+      if (!operations) {
+        this.pendingOperations = [];
+      }
+      this.lastHeadCommit = result.head_commit;
+      this.updateStatus("success");
+      return result;
+    } catch (error) {
+      console.error("SyncService: V2 batch sync error", error);
+      this.updateStatus("error", error instanceof Error ? error.message : "Unknown error");
+      throw error;
+    }
+  }
+  /**
+   * Process V2 sync results and update local state
+   */
+  async processV2Results(operations, response) {
+    var _a;
+    for (const result of response.results) {
+      const operation = operations[result.index];
+      if (!operation) {
+        console.warn(`SyncService: No operation found for result index ${result.index}`);
+        continue;
+      }
+      const path = operation.path;
+      if (!result.success) {
+        console.error(`SyncService: Operation ${operation.type} failed for ${path}:`, result.error);
+        continue;
+      }
+      switch (operation.type) {
+        case "create":
+        case "modify": {
+          if (result.has_conflicts && result.merged_content) {
+            await this.handleV2Conflict(path, result);
+          } else if (result.merged && result.merged_content) {
+            const file = this.vault.getAbstractFileByPath(path);
+            if (file instanceof import_obsidian.TFile) {
+              const mergedBuffer = this.base64ToArrayBuffer(result.merged_content);
+              await this.vault.modifyBinary(file, mergedBuffer);
+              console.log(`SyncService: Updated ${path} with merged content`);
+            }
+          }
+          this.syncState[path] = {
+            hash: result.hash || "",
+            commit: result.commit || "",
+            file_id: result.file_id
+          };
+          console.log(`SyncService: ${operation.type} succeeded for ${path} (file_id: ${result.file_id})`);
+          break;
+        }
+        case "rename": {
+          if (operation.old_path) {
+            delete this.syncState[operation.old_path];
+            this.pendingRenames.delete(operation.old_path);
+          }
+          this.syncState[path] = {
+            hash: result.hash || ((_a = this.syncState[path]) == null ? void 0 : _a.hash) || "",
+            commit: result.commit || "",
+            file_id: result.file_id || operation.file_id
+          };
+          console.log(`SyncService: Rename succeeded: ${operation.old_path} -> ${path}`);
+          break;
+        }
+        case "delete": {
+          delete this.syncState[path];
+          console.log(`SyncService: Delete succeeded for ${path}`);
+          break;
+        }
+      }
+    }
+    await this.saveSyncState();
+  }
+  /**
+   * Handle V2 conflict from batch result
+   */
+  async handleV2Conflict(path, result) {
+    var _a;
+    console.log(`SyncService: Handling V2 conflict for: ${path}`);
+    if (!result.merged_content) {
+      console.error("SyncService: No merged content in V2 conflict response");
+      return;
+    }
+    const file = this.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian.TFile)) {
+      return;
+    }
+    const localContent = await this.vault.read(file);
+    const mergedContent = Buffer.from(result.merged_content, "base64").toString("utf-8");
+    const conflict = {
+      path,
+      mergedContent,
+      localContent,
+      serverCommit: result.commit || ""
+    };
+    switch (this.settings.conflictMode) {
+      case "ask":
+        this.pendingConflicts.push(conflict);
+        (_a = this.conflictCallback) == null ? void 0 : _a.call(this, conflict);
+        new import_obsidian.Notice(`Scion Sync: Conflict in "${path}" - please resolve`);
+        break;
+      case "local":
+        console.log(`SyncService: Keeping local version for ${path}`);
+        this.syncState[path] = {
+          hash: result.hash || "",
+          commit: result.commit || "",
+          file_id: result.file_id
+        };
+        await this.queueFileForUpload(path);
+        break;
+      case "remote":
+        console.log(`SyncService: Taking server version for ${path}`);
+        await this.downloadFile(path);
+        break;
+      case "merge":
+      default:
+        console.log(`SyncService: Writing merged content with markers for ${path}`);
+        await this.vault.modify(file, mergedContent);
+        this.syncState[path] = {
+          hash: result.hash || "",
+          commit: result.commit || "",
+          file_id: result.file_id
+        };
+        new import_obsidian.Notice(`Scion Sync: Conflict in "${path}" - resolve markers and save`);
+        break;
+    }
+  }
+  /**
+   * Queue a file for upload as a V2 operation
+   */
+  async queueFileForUpload(path) {
+    const file = this.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian.TFile)) {
+      console.warn(`SyncService: Cannot queue upload, file not found: ${path}`);
+      return;
+    }
+    const content = await this.vault.readBinary(file);
+    const base64Content = this.arrayBufferToBase64(content);
+    const localState = this.syncState[path];
+    const operation = (localState == null ? void 0 : localState.file_id) ? {
+      type: "modify",
+      path,
+      file_id: localState.file_id,
+      content: base64Content,
+      base_commit: localState.commit
+    } : {
+      type: "create",
+      path,
+      content: base64Content
+    };
+    this.queueOperation(operation);
   }
   async computeLocalHash(path) {
     console.log(`SyncService: Computing hash for: ${path}`);
@@ -602,12 +902,18 @@ var _SyncService = class _SyncService {
       clearTimeout(this.activityTimer);
       this.activityTimer = null;
     }
+    if (this.batchSyncTimer) {
+      clearTimeout(this.batchSyncTimer);
+      this.batchSyncTimer = null;
+    }
     const timerCount = this.debounceTimers.size;
     for (const timer of this.debounceTimers.values()) {
       clearTimeout(timer);
     }
     this.debounceTimers.clear();
     console.log(`SyncService: Cleared ${timerCount} debounce timers`);
+    this.pendingOperations = [];
+    this.pendingRenames.clear();
     const refCount = this.eventRefs.length;
     for (const ref of this.eventRefs) {
       this.vault.offref(ref);

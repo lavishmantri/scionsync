@@ -3,7 +3,7 @@ import { SyncService, SyncStatus, ScionSyncSettings } from './sync-service';
 
 interface ScionSyncData {
   settings: ScionSyncSettings;
-  syncState: Record<string, { hash: string; commit: string }>;
+  syncState: Record<string, { hash: string; commit: string; file_id?: string }>;
 }
 
 const DEFAULT_SETTINGS: ScionSyncSettings = {
@@ -18,7 +18,7 @@ const DEFAULT_SETTINGS: ScionSyncSettings = {
 export default class ScionSyncPlugin extends Plugin {
   settings: ScionSyncSettings = DEFAULT_SETTINGS;
   private syncService: SyncService | null = null;
-  private syncState: Record<string, { hash: string; commit: string }> = {};
+  private syncState: Record<string, { hash: string; commit: string; file_id?: string }> = {};
   private statusBarItem: HTMLElement | null = null;
 
   async onload() {
